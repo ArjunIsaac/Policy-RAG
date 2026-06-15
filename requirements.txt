@@ -1,30 +1,25 @@
-# ============================================================
 # policy-interrogator — requirements.txt
-# Install with:  uv pip install -r requirements.txt
-# ============================================================
- 
-# --- PDF parsing ---
-pdfplumber==0.11.4
-pdfminer.six==20231228          # pdfplumber dependency (explicit pin)
- 
-# --- Vector store ---
-chromadb==0.5.23
-onnxruntime==1.18.1             # chromadb's default embedding runtime
- 
-# --- LangChain core ---
-langchain==0.3.25
-langchain-core==0.3.60
-langchain-community==0.3.24
- 
-# --- LangChain ↔ Ollama integration ---
-langchain-ollama==0.2.3
- 
-# --- LangChain ↔ Chroma integration ---
-langchain-chroma==0.2.4
- 
-# --- Streamlit UI ---
-streamlit==1.45.1
- 
-# --- Utilities ---
-python-dotenv==1.0.1            # optional: load .env vars
-tqdm==4.67.1                    # progress bars in scripts
+# Generated from a working environment; install with:
+#   uv pip install -r requirements.txt
+
+# PDF parsing
+pdfplumber==0.11.9
+
+# Vector store
+chromadb==1.5.9
+
+# LangChain — standalone integration packages only (langchain-community not needed)
+langchain==1.3.9
+langchain-core==1.4.7
+langchain-ollama==1.1.0
+langchain-chroma==1.1.0
+
+# Streamlit
+streamlit==1.58.0
+
+# Data (comparison table in UI)
+pandas==3.0.2
+
+# Utilities
+python-dotenv>=1.0
+tqdm>=4.67

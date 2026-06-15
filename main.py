@@ -1,22 +1,30 @@
+"""
+main.py — Policy Interrogator
+Streamlit UI with:
+  • Multi-document upload & indexing
+  • Per-policy attribute extraction dashboard
+  • Side-by-side policy comparison
+  • Conversation loop with page + line citations
+"""
 
 from __future__ import annotations
 
+import json
 import sys
-import time
 from pathlib import Path
 
 import streamlit as st
 
-# ---------------------------------------------------------------------------
-# Path setup — makes `src/` importable when running from project root
 sys.path.insert(0, str(Path(__file__).parent / "src"))
 
 from ingestor import PDFIngestor
 from vector_store import PolicyVectorStore
 from chain import PolicyChain
 
-
+# ---------------------------------------------------------------------------
 # Constants
+# ---------------------------------------------------------------------------
+
 DATA_DIR = Path("data/raw")
 CHROMA_DIR = Path("data/chroma_db")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -24,16 +32,39 @@ CHROMA_DIR.mkdir(parents=True, exist_ok=True)
 
 QUICK_QUESTIONS = [
     "What is the waiting period for pre-existing diseases?",
-    "Is there a co-pay clause? What percentage?",
-    "What are the sub-limits for room rent?",
-    "What procedures are excluded from coverage?",
-    "What is the sum insured and how can it be enhanced?",
+    "Is there a co-pay clause? What percentage applies?",
+    "What are the sub-limits for room rent and ICU?",
+    "List all permanent exclusions.",
+    "What is the No Claim Bonus benefit?",
+    "What are the sum insured options?",
+    "How many network hospitals are covered?",
     "What is the grace period for renewal?",
 ]
 
+ATTR_LABELS: dict[str, str] = {
+    "policy_name": "Policy Name",
+    "insurer": "Insurer",
+    "sum_insured": "Sum Insured Options",
+    "waiting_period_initial": "Initial Waiting Period (days)",
+    "waiting_period_ped": "PED Waiting Period (days)",
+    "waiting_period_specific": "Specific Illness Waiting Period (days)",
+    "copay_percentage": "Co-pay %",
+    "copay_conditions": "Co-pay Conditions",
+    "room_rent_sublimit": "Room Rent Sub-limit",
+    "icu_sublimit": "ICU Sub-limit",
+    "maternity_covered": "Maternity Covered",
+    "daycare_procedures": "Day Care Procedures",
+    "exclusions_permanent": "Permanent Exclusions",
+    "grace_period_days": "Grace Period (days)",
+    "renewal_type": "Renewal Type",
+    "ncb_benefit": "No Claim Bonus",
+    "network_hospitals": "Network Hospitals",
+}
+
 # ---------------------------------------------------------------------------
-# Streamlit page config
+# Page config + CSS
 # ---------------------------------------------------------------------------
+
 st.set_page_config(
     page_title="Policy Interrogator",
     page_icon="📋",
@@ -41,220 +72,396 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ---------------------------------------------------------------------------
-# Custom CSS
-# ---------------------------------------------------------------------------
-st.markdown(
-    """
-    <style>
-        /* Main background */
-        .stApp { background-color: #0f1117; }
+st.markdown("""
+<style>
+  .stApp { background-color: #0d1117; color: #c9d1d9; }
+  [data-testid="stSidebar"] { background-color: #161b22; }
 
-        /* Sidebar */
-        [data-testid="stSidebar"] { background-color: #161b27; }
-
-        /* Chat bubbles */
-        .user-bubble {
-            background: #1e3a5f;
-            border-radius: 12px 12px 2px 12px;
-            padding: 10px 16px;
-            margin: 6px 0 6px 60px;
-            color: #e2e8f0;
-            font-size: 0.95rem;
-        }
-        .assistant-bubble {
-            background: #1a2235;
-            border: 1px solid #2d3748;
-            border-radius: 12px 12px 12px 2px;
-            padding: 14px 18px;
-            margin: 6px 60px 6px 0;
-            color: #e2e8f0;
-            font-size: 0.95rem;
-            line-height: 1.6;
-        }
-        .source-tag {
-            display: inline-block;
-            background: #2d3748;
-            color: #90cdf4;
-            border-radius: 4px;
-            padding: 2px 8px;
-            font-size: 0.78rem;
-            margin: 3px 3px 0 0;
-        }
-        .quick-pill {
-            font-size: 0.82rem;
-        }
-        .stSpinner > div { color: #63b3ed; }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+  .user-bubble {
+    background: #1f3a5f; border-radius: 14px 14px 4px 14px;
+    padding: 10px 16px; margin: 8px 0 8px 80px; font-size:.95rem; color:#e6edf3;
+  }
+  .bot-bubble {
+    background: #161b22; border: 1px solid #30363d;
+    border-radius: 14px 14px 14px 4px;
+    padding: 14px 18px; margin: 8px 80px 8px 0;
+    font-size:.95rem; color:#e6edf3; line-height:1.7;
+  }
+  .cite-badge {
+    display:inline-block; background:#21262d; border:1px solid #30363d;
+    color:#58a6ff; border-radius:6px; padding:2px 9px;
+    font-size:.76rem; margin:3px 3px 0 0; font-family:monospace;
+  }
+  .attr-card {
+    background:#161b22; border:1px solid #30363d; border-radius:10px;
+    padding:14px 18px; margin-bottom:10px;
+  }
+  .attr-label { color:#8b949e; font-size:.78rem; text-transform:uppercase; letter-spacing:.06em; }
+  .attr-value { color:#e6edf3; font-size:1rem; font-weight:500; margin-top:2px; }
+  .section-header {
+    color:#58a6ff; font-size:.85rem; font-weight:700;
+    text-transform:uppercase; letter-spacing:.1em; margin:18px 0 8px;
+  }
+  div[data-testid="stTabs"] button { font-size:.9rem; }
+</style>
+""", unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
-# Session state initialisation
+# Session state
 # ---------------------------------------------------------------------------
 
-def _init_state() -> None:
+def _init():
     defaults = {
-        "messages": [],          # {"role": "user"|"assistant", "content": str, "sources": list}
-        "vector_store": None,
-        "policy_chain": None,
-        "indexed_files": [],
-        "active_source": None,
+        "messages": [],
+        "chain": None,
+        "selected_sources": [],
+        "extracted_attrs": {},   # {source_name: dict}
+        "compare_mode": False,
     }
-    for key, val in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = val
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
+_init()
 
-_init_state()
+# ---------------------------------------------------------------------------
+# Cached resources
+# ---------------------------------------------------------------------------
 
-
-# Backend helpers (cached)
 @st.cache_resource(show_spinner="Connecting to vector store …")
-def get_vector_store() -> PolicyVectorStore:
+def get_store() -> PolicyVectorStore:
     return PolicyVectorStore(persist_dir=CHROMA_DIR)
 
 
-def get_chain(source_filter: str | None = None) -> PolicyChain:
-    """Build / rebuild the chain, keyed by active source."""
-    store = get_vector_store()
+def get_chain(sources: list[str] | None) -> PolicyChain:
     return PolicyChain(
-        vector_store=store,
+        vector_store=get_store(),
         model="mistral",
-        temperature=0.1,
+        temperature=0.05,
         k_docs=6,
-        source_filter=source_filter,
+        source_filter=sources if sources else None,
+    )
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _render_value(v) -> str:
+    if isinstance(v, list):
+        return ", ".join(str(x) for x in v)
+    if isinstance(v, bool):
+        return "Yes" if v else "No"
+    if v is None:
+        return "—"
+    return str(v)
+
+
+def _attr_card(label: str, value) -> None:
+    val_str = _render_value(value)
+    st.markdown(
+        f'<div class="attr-card">'
+        f'<div class="attr-label">{label}</div>'
+        f'<div class="attr-value">{val_str}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
     )
 
 
+def _citation_badges(sources: list[dict]) -> str:
+    html = ""
+    for s in sources:
+        clause = f", {s['clause']}" if s.get("clause") else ""
+        label = f"📄 {s['source']}  p.{s['page']} ~l.{s['line']}{clause}"
+        html += f'<span class="cite-badge">{label}</span>'
+    return html
 
+
+def _run_query(question: str) -> None:
+    if st.session_state.chain is None:
+        st.warning("Please select at least one policy from the sidebar first.")
+        return
+    st.session_state.messages.append({"role": "user", "content": question})
+    with st.spinner("Retrieving …"):
+        result = st.session_state.chain.ask(question)
+    st.session_state.messages.append({
+        "role": "assistant",
+        "content": result["answer"],
+        "sources": result["sources"],
+    })
+
+
+# ---------------------------------------------------------------------------
 # Sidebar
+# ---------------------------------------------------------------------------
+
 with st.sidebar:
-    st.markdown("##  Policy Interrogator")
-    st.caption("RAG-powered insurance policy analysis")
+    st.markdown("## 📋 Policy Interrogator")
+    st.caption("Local RAG — powered by Mistral + ChromaDB")
     st.divider()
 
     # --- Upload ---
-    st.markdown("### Upload Policy PDF")
-    uploaded = st.file_uploader(
-        label="Drop PDF here",
+    st.markdown('<div class="section-header">Upload PDFs</div>', unsafe_allow_html=True)
+    uploaded_files = st.file_uploader(
+        "Drop one or more policy PDFs",
         type=["pdf"],
+        accept_multiple_files=True,
         label_visibility="collapsed",
     )
 
-    if uploaded is not None:
-        save_path = DATA_DIR / uploaded.name
-        if not save_path.exists():
-            with open(save_path, "wb") as f:
-                f.write(uploaded.read())
-            st.success(f"Saved: {uploaded.name}")
+    if uploaded_files:
+        new_files = []
+        for uf in uploaded_files:
+            save_path = DATA_DIR / uf.name
+            if not save_path.exists():
+                with open(save_path, "wb") as f:
+                    f.write(uf.read())
+                new_files.append(save_path)
+            else:
+                new_files.append(save_path)  # already saved
 
-        if st.button("Index this PDF", use_container_width=True):
-            with st.spinner("Parsing and embedding — this takes ~30 s per 60 pages …"):
-                ingestor = PDFIngestor(chunk_size=600, overlap=120)
-                chunks = ingestor.ingest(save_path)
-                store = get_vector_store()
+        if st.button("⚡ Index uploaded PDFs", use_container_width=True):
+            store = get_store()
+            ingestor = PDFIngestor(chunk_size=500, overlap=100)
+            total_added = 0
+            prog = st.progress(0, text="Indexing …")
+            for idx, fp in enumerate(new_files):
+                prog.progress((idx) / len(new_files), text=f"Parsing {fp.name} …")
+                chunks = ingestor.ingest(fp)
                 added = store.add_chunks(chunks)
-            st.success(f"Added {added} new chunks to the store.")
-            if uploaded.name not in st.session_state.indexed_files:
-                st.session_state.indexed_files.append(uploaded.name)
+                total_added += added
+            prog.progress(1.0, text="Done!")
+            st.success(f"Added {total_added} new chunks across {len(new_files)} file(s).")
+            # Invalidate chain
+            st.session_state.chain = None
+            st.session_state.messages = []
 
     st.divider()
 
     # --- Source selector ---
-    st.markdown("### Active Policy")
-    store = get_vector_store()
+    store = get_store()
     sources = store.list_sources()
 
+    st.markdown('<div class="section-header">Active Policies</div>', unsafe_allow_html=True)
+
     if sources:
-        choice = st.selectbox(
-            "Filter responses to:",
-            options=["All indexed policies"] + sources,
-            index=0,
+        selected = st.multiselect(
+            "Select policies to query / compare:",
+            options=sources,
+            default=st.session_state.selected_sources or sources[:1],
+            label_visibility="collapsed",
         )
-        active = None if choice == "All indexed policies" else choice
-        if active != st.session_state.active_source:
-            st.session_state.active_source = active
-            st.session_state.policy_chain = None   # force rebuild
+
+        if selected != st.session_state.selected_sources:
+            st.session_state.selected_sources = selected
+            st.session_state.chain = None
             st.session_state.messages = []
+
+        compare_mode = len(selected) > 1
+        st.session_state.compare_mode = compare_mode
+
+        if compare_mode:
+            st.info(f"Comparing {len(selected)} policies.")
+
+        # Build chain lazily
+        if st.session_state.chain is None and selected and store.count() > 0:
+            with st.spinner("Loading Mistral …"):
+                st.session_state.chain = get_chain(selected)
     else:
-        st.info("No policies indexed yet. Upload a PDF above.")
+        st.info("Upload and index a PDF to get started.")
 
     st.divider()
 
     # --- Stats ---
-    st.markdown("### Store Stats")
-    total_chunks = store.count()
-    st.metric("Total chunks", total_chunks)
-    st.metric("Policies indexed", len(sources))
+    st.markdown('<div class="section-header">Store Stats</div>', unsafe_allow_html=True)
+    col1, col2 = st.columns(2)
+    col1.metric("Chunks", store.count())
+    col2.metric("Policies", len(sources))
 
-    if st.button("🗑️ Reset conversation", use_container_width=True):
+    if st.button("🔄 Reset chat", use_container_width=True):
         st.session_state.messages = []
-        st.session_state.policy_chain = None
+        if st.session_state.chain:
+            st.session_state.chain.reset_memory()
         st.rerun()
 
+# ---------------------------------------------------------------------------
+# Main area — tabs
+# ---------------------------------------------------------------------------
 
+tab_chat, tab_attrs, tab_compare = st.tabs([
+    "💬 Chat",
+    "📊 Policy Attributes",
+    "⚖️ Compare Policies",
+])
 
-# Main area
-st.markdown("## Insurance Policy Q&A")
+# ===========================================================================
+# TAB 1 — CHAT
+# ===========================================================================
+with tab_chat:
+    selected_sources = st.session_state.get("selected_sources", [])
 
-active_source = st.session_state.active_source
-if active_source:
-    st.caption(f"Querying: **{active_source}**")
-else:
-    st.caption("Querying: all indexed policies")
-
-# Lazy-build chain
-if st.session_state.policy_chain is None and store.count() > 0:
-    with st.spinner("Loading Mistral via Ollama …"):
-        st.session_state.policy_chain = get_chain(source_filter=active_source)
-
-# Chat history
-for msg in st.session_state.messages:
-    if msg["role"] == "user":
-        st.markdown(f'<div class="user-bubble">🧑 {msg["content"]}</div>', unsafe_allow_html=True)
+    if selected_sources:
+        st.caption("Querying: " + " · ".join(f"**{s}**" for s in selected_sources))
     else:
-        st.markdown(f'<div class="assistant-bubble">🤖 {msg["content"]}</div>', unsafe_allow_html=True)
-        if msg.get("sources"):
-            cols_per_row = 4
-            source_html = ""
-            for s in msg["sources"]:
-                label = f"📄 {s['source']}  p.{s['page']}"
-                source_html += f'<span class="source-tag">{label}</span>'
-            st.markdown(source_html, unsafe_allow_html=True)
+        st.caption("No policy selected — use the sidebar.")
 
-# Quick questions
-if not st.session_state.messages and store.count() > 0:
-    st.markdown("#### Try a quick question:")
-    cols = st.columns(2)
-    for i, q in enumerate(QUICK_QUESTIONS):
-        if cols[i % 2].button(q, key=f"quick_{i}", use_container_width=True):
-            st.session_state._quick_prompt = q
+    # Chat history
+    for msg in st.session_state.messages:
+        if msg["role"] == "user":
+            st.markdown(
+                f'<div class="user-bubble">🧑 {msg["content"]}</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f'<div class="bot-bubble">🤖 {msg["content"]}</div>',
+                unsafe_allow_html=True,
+            )
+            if msg.get("sources"):
+                st.markdown(_citation_badges(msg["sources"]), unsafe_allow_html=True)
+            st.markdown("")
+
+    # Quick questions (shown only before first message)
+    if not st.session_state.messages and store.count() > 0:
+        st.markdown("#### Suggested questions")
+        cols = st.columns(2)
+        for i, q in enumerate(QUICK_QUESTIONS):
+            if cols[i % 2].button(q, key=f"qq_{i}", use_container_width=True):
+                _run_query(q)
+                st.rerun()
+
+    # Quick-prompt passthrough (set by comparison tab)
+    if st.session_state.get("_pending_prompt"):
+        q = st.session_state.pop("_pending_prompt")
+        _run_query(q)
+        st.rerun()
+
+    # Input
+    if store.count() == 0:
+        st.warning("Index at least one PDF using the sidebar to start asking questions.")
+    else:
+        user_input = st.chat_input("Ask anything about the selected policy/policies …")
+        if user_input:
+            _run_query(user_input)
             st.rerun()
 
-# Process quick prompt 
-if hasattr(st.session_state, "_quick_prompt") and st.session_state._quick_prompt:
-    prompt = st.session_state._quick_prompt
-    del st.session_state._quick_prompt
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.spinner("Retrieving from policy …"):
-        result = st.session_state.policy_chain.ask(prompt)
-    st.session_state.messages.append(
-        {"role": "assistant", "content": result["answer"], "sources": result["sources"]}
-    )
-    st.rerun()
+# ===========================================================================
+# TAB 2 — POLICY ATTRIBUTES
+# ===========================================================================
+with tab_attrs:
+    selected_sources = st.session_state.get("selected_sources", [])
 
-# Text input
-if store.count() == 0:
-    st.warning("Index at least one PDF using the sidebar before asking questions.")
-else:
-    user_input = st.chat_input("Ask anything about the policy …")
-    if user_input:
-        st.session_state.messages.append({"role": "user", "content": user_input})
-        with st.spinner("Thinking …"):
-            result = st.session_state.policy_chain.ask(user_input)
-        st.session_state.messages.append(
-            {"role": "assistant", "content": result["answer"], "sources": result["sources"]}
-        )
-        st.rerun()
+    if not selected_sources:
+        st.info("Select a policy in the sidebar to extract its key attributes.")
+    else:
+        for src in selected_sources:
+            st.markdown(f"### {src}")
+
+            cached = st.session_state.extracted_attrs.get(src)
+
+            col_btn, col_note = st.columns([1, 3])
+            if col_btn.button(f"Extract attributes", key=f"extract_{src}"):
+                with st.spinner(f"Analysing {src} …"):
+                    tmp_chain = get_chain([src])
+                    attrs = tmp_chain.extract_attributes(source_filter=[src])
+                    st.session_state.extracted_attrs[src] = attrs
+                    cached = attrs
+
+            if cached:
+                if "_error" in cached:
+                    with st.expander("Raw LLM output (JSON parse failed)"):
+                        st.code(cached.get("_raw", ""))
+                else:
+                    # Group into sections
+                    waiting = ["waiting_period_initial", "waiting_period_ped", "waiting_period_specific"]
+                    copay   = ["copay_percentage", "copay_conditions"]
+                    limits  = ["room_rent_sublimit", "icu_sublimit"]
+                    cover   = ["maternity_covered", "daycare_procedures", "sum_insured", "network_hospitals"]
+                    policy  = ["policy_name", "insurer", "renewal_type", "grace_period_days", "ncb_benefit"]
+                    excl    = ["exclusions_permanent"]
+
+                    sections = {
+                        "Policy Overview": policy,
+                        "Waiting Periods": waiting,
+                        "Co-pay": copay,
+                        "Sub-limits": limits,
+                        "Coverage": cover,
+                        "Permanent Exclusions": excl,
+                    }
+
+                    for section_title, keys in sections.items():
+                        st.markdown(
+                            f'<div class="section-header">{section_title}</div>',
+                            unsafe_allow_html=True,
+                        )
+                        cols = st.columns(min(len(keys), 3))
+                        for i, key in enumerate(keys):
+                            with cols[i % len(cols)]:
+                                _attr_card(
+                                    ATTR_LABELS.get(key, key),
+                                    cached.get(key),
+                                )
+            else:
+                st.caption("Click **Extract attributes** to auto-analyse this policy.")
+
+            if len(selected_sources) > 1:
+                st.divider()
+
+# ===========================================================================
+# TAB 3 — COMPARE POLICIES
+# ===========================================================================
+with tab_compare:
+    selected_sources = st.session_state.get("selected_sources", [])
+
+    if len(selected_sources) < 2:
+        st.info("Select **2 or more** policies in the sidebar to compare them.")
+    else:
+        st.markdown(f"### Side-by-side: {' vs '.join(selected_sources)}")
+
+        # Make sure attributes are extracted for all selected
+        missing = [s for s in selected_sources if s not in st.session_state.extracted_attrs]
+        if missing:
+            if st.button("📊 Extract all attributes for comparison", use_container_width=True):
+                prog = st.progress(0)
+                for idx, src in enumerate(missing):
+                    prog.progress(idx / len(missing), text=f"Extracting {src} …")
+                    tmp = get_chain([src])
+                    st.session_state.extracted_attrs[src] = tmp.extract_attributes(source_filter=[src])
+                prog.progress(1.0, text="Done!")
+                st.rerun()
+        else:
+            # Build comparison table
+            import pandas as pd
+
+            rows = []
+            for key, label in ATTR_LABELS.items():
+                row = {"Attribute": label}
+                for src in selected_sources:
+                    attrs = st.session_state.extracted_attrs.get(src, {})
+                    row[src] = _render_value(attrs.get(key))
+                rows.append(row)
+
+            df = pd.DataFrame(rows).set_index("Attribute")
+
+            # Highlight differences
+            def highlight_diff(row):
+                vals = row.values
+                if len(set(str(v) for v in vals)) > 1:
+                    return ["background-color: #2d1f00; color: #ffa657"] * len(vals)
+                return [""] * len(vals)
+
+            styled = df.style.apply(highlight_diff, axis=1)
+            st.dataframe(styled, use_container_width=True, height=600)
+            st.caption("🟠 Highlighted rows have differing values across policies.")
+
+            st.divider()
+            st.markdown("### Ask a comparison question")
+            cmp_q = st.text_input(
+                "e.g. Which policy has a shorter PED waiting period?",
+                key="cmp_input",
+            )
+            if st.button("Ask", key="cmp_ask") and cmp_q:
+                st.session_state["_pending_prompt"] = cmp_q
+                # Switch to chat tab by triggering rerun — user sees answer in Chat tab
+                st.info("Answer will appear in the **Chat** tab.")
+                _run_query(cmp_q)
+                st.rerun()

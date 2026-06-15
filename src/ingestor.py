@@ -1,4 +1,10 @@
-
+"""
+ingestor.py
+-----------
+Parses insurance policy PDFs using pdfplumber.
+Extracts text and tables, chunks with sliding window, and records
+page number + approximate line/clause number for citations.
+"""
 
 from __future__ import annotations
 
@@ -16,186 +22,176 @@ import pdfplumber
 
 @dataclass
 class Chunk:
-    """A single piece of content extracted from a PDF."""
     text: str
     metadata: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Insurance keyword detection
 # ---------------------------------------------------------------------------
 
 _SECTION_PATTERNS = [
-    r"(waiting period[s]?)",
-    r"(co[\-\s]?pay[ment]*)",
-    r"(sub[\-\s]?limit[s]?)",
-    r"(exclusion[s]?)",
-    r"(pre[\-\s]?existing)",
-    r"(deductible[s]?)",
-    r"(premium[s]?)",
-    r"(benefit[s]?)",
-    r"(coverage|covered)",
-    r"(network hospital[s]?)",
-    r"(claim[s]? procedure)",
-    r"(grace period)",
-    r"(renewal)",
-    r"(sum insured)",
+    r"waiting period[s]?",
+    r"co[\-\s]?pay[ment]*",
+    r"sub[\-\s]?limit[s]?",
+    r"exclusion[s]?",
+    r"pre[\-\s]?existing",
+    r"deductible[s]?",
+    r"premium[s]?",
+    r"benefit[s]?",
+    r"coverage|covered",
+    r"network hospital[s]?",
+    r"claim[s]? procedure",
+    r"grace period",
+    r"renewal",
+    r"sum insured",
+    r"room rent",
+    r"icu charges?",
+    r"day care",
+    r"maternity",
+    r"ambulance",
 ]
 
 _SECTION_RE = re.compile("|".join(_SECTION_PATTERNS), re.IGNORECASE)
 
+# Matches things like "1.", "1.1", "a)", "(i)", "Clause 3", "Section 4"
+_CLAUSE_RE = re.compile(
+    r"(?:^|\n)\s*"
+    r"(?:clause|section|article|para(?:graph)?|point)?\s*"
+    r"(?:\d+(?:\.\d+)*[.):]|[a-zA-Z][.):]|\([ivxlIVXL\d]+\))",
+    re.IGNORECASE,
+)
 
-def _detect_section_tags(text: str) -> list[str]:
-    """Return a deduplicated list of insurance-specific tags found in text."""
-    return list({m.group(0).lower() for m in _SECTION_RE.finditer(text)})
+
+def _detect_tags(text: str) -> list[str]:
+    return list({m.group(0).strip().lower() for m in _SECTION_RE.finditer(text)})
+
+
+def _detect_clause(text: str) -> str:
+    """Return the first clause/section marker found in the chunk, or ''."""
+    m = _CLAUSE_RE.search(text)
+    return m.group(0).strip() if m else ""
 
 
 def _table_to_text(table: list[list[str | None]]) -> str:
-    """Convert a pdfplumber table (list of rows) into a Markdown-style string."""
     if not table:
         return ""
     lines: list[str] = []
     for row in table:
         clean = [str(cell).strip() if cell is not None else "" for cell in row]
         lines.append(" | ".join(clean))
-    # Insert a separator after the header row
     if len(lines) > 1:
-        lines.insert(1, "-" * len(lines[0]))
+        lines.insert(1, "-" * max(len(l) for l in lines))
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# Chunking strategy
+# Sliding-window chunker  (word-level, preserves line numbers)
 # ---------------------------------------------------------------------------
 
-def _sliding_window_chunks(
+def _sliding_chunks(
     text: str,
-    chunk_size: int = 600,
-    overlap: int = 120,
-) -> Generator[str, None, None]:
+    chunk_size: int = 500,
+    overlap: int = 100,
+) -> Generator[tuple[str, int], None, None]:
     """
-    Yield overlapping text windows.
-    Splitting on whitespace boundaries keeps words intact.
+    Yield (chunk_text, start_line) pairs.
+    start_line is the 1-based line number where this chunk begins.
     """
-    words = text.split()
-    if not words:
+    lines = text.split("\n")
+    words_with_lines: list[tuple[str, int]] = []
+    for lineno, line in enumerate(lines, start=1):
+        for word in line.split():
+            words_with_lines.append((word, lineno))
+
+    if not words_with_lines:
         return
+
     start = 0
-    while start < len(words):
-        end = start + chunk_size
-        yield " ".join(words[start:end])
-        if end >= len(words):
+    while start < len(words_with_lines):
+        end = min(start + chunk_size, len(words_with_lines))
+        chunk_words = words_with_lines[start:end]
+        text_chunk = " ".join(w for w, _ in chunk_words)
+        start_line = chunk_words[0][1]
+        yield text_chunk, start_line
+        if end >= len(words_with_lines):
             break
         start += chunk_size - overlap
 
 
 # ---------------------------------------------------------------------------
-# Public API
+# Public ingestor
 # ---------------------------------------------------------------------------
 
 class PDFIngestor:
-    """
-    Reads a PDF with pdfplumber and returns a list of Chunk objects,
-    each annotated with page number, source filename, and detected tags.
-    """
-
-    def __init__(
-        self,
-        chunk_size: int = 600,
-        overlap: int = 120,
-    ) -> None:
+    def __init__(self, chunk_size: int = 500, overlap: int = 100) -> None:
         self.chunk_size = chunk_size
         self.overlap = overlap
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
     def _process_page(
-        self,
-        page: pdfplumber.page.Page,
-        source: str,
-        page_num: int,
+        self, page: pdfplumber.page.Page, source: str, page_num: int
     ) -> list[Chunk]:
         chunks: list[Chunk] = []
+        table_header_texts: list[str] = []
 
-        # 1. Extract tables first so their text doesn't muddy the prose
-        table_texts: list[str] = []
+        # 1. Tables
         try:
-            tables = page.extract_tables()
-            for table in tables:
+            for table in page.extract_tables() or []:
                 table_text = _table_to_text(table)
-                if table_text.strip():
-                    table_texts.append(table_text)
-                    tags = _detect_section_tags(table_text)
-                    chunks.append(
-                        Chunk(
-                            text=table_text,
-                            metadata={
-                                "source": source,
-                                "page": page_num,
-                                "type": "table",
-                                "tags": tags,
-                            },
-                        )
-                    )
+                if not table_text.strip():
+                    continue
+                header = table_text.split("\n")[0]
+                table_header_texts.append(header)
+                tags = _detect_tags(table_text)
+                clause = _detect_clause(table_text)
+                chunks.append(Chunk(
+                    text=table_text,
+                    metadata={
+                        "source": source,
+                        "page": page_num,
+                        "line": 1,
+                        "clause": clause,
+                        "type": "table",
+                        "tags": tags,
+                    },
+                ))
         except Exception:
-            pass  # Some pages have no extractable tables
+            pass
 
-        # 2. Extract prose text (suppress table bounding boxes to avoid duplication)
+        # 2. Prose
         try:
             prose = page.extract_text(x_tolerance=3, y_tolerance=3) or ""
         except Exception:
             prose = ""
 
-        # Remove table content we already captured (rough dedup)
-        for tt in table_texts:
-            # Remove first line of the table (header) from prose if present
-            header = tt.split("\n")[0]
-            prose = prose.replace(header, "")
-
+        for hdr in table_header_texts:
+            prose = prose.replace(hdr, "", 1)
         prose = prose.strip()
+
         if not prose:
             return chunks
 
-        # 3. Chunk the prose with a sliding window
-        for window in _sliding_window_chunks(prose, self.chunk_size, self.overlap):
-            window = window.strip()
-            if not window:
+        for chunk_text, start_line in _sliding_chunks(prose, self.chunk_size, self.overlap):
+            chunk_text = chunk_text.strip()
+            if not chunk_text:
                 continue
-            tags = _detect_section_tags(window)
-            chunks.append(
-                Chunk(
-                    text=window,
-                    metadata={
-                        "source": source,
-                        "page": page_num,
-                        "type": "text",
-                        "tags": tags,
-                    },
-                )
-            )
+            tags = _detect_tags(chunk_text)
+            clause = _detect_clause(chunk_text)
+            chunks.append(Chunk(
+                text=chunk_text,
+                metadata={
+                    "source": source,
+                    "page": page_num,
+                    "line": start_line,
+                    "clause": clause,
+                    "type": "text",
+                    "tags": tags,
+                },
+            ))
 
         return chunks
 
-    # ------------------------------------------------------------------
-    # Public
-    # ------------------------------------------------------------------
-
     def ingest(self, pdf_path: str | Path) -> list[Chunk]:
-        """
-        Parse *pdf_path* and return all chunks extracted from it.
-
-        Parameters
-        ----------
-        pdf_path : str | Path
-            Path to the PDF file.
-
-        Returns
-        -------
-        list[Chunk]
-            Ordered list of chunks with metadata.
-        """
         pdf_path = Path(pdf_path)
         if not pdf_path.exists():
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
@@ -205,13 +201,11 @@ class PDFIngestor:
 
         with pdfplumber.open(str(pdf_path)) as pdf:
             total = len(pdf.pages)
-            print(f"[ingestor] Opening '{source}' — {total} pages")
+            print(f"[ingestor] '{source}' — {total} pages")
             for i, page in enumerate(pdf.pages, start=1):
-                page_chunks = self._process_page(page, source, i)
-                all_chunks.extend(page_chunks)
+                all_chunks.extend(self._process_page(page, source, i))
                 if i % 10 == 0 or i == total:
-                    print(f"[ingestor]   Processed {i}/{total} pages "
-                          f"({len(all_chunks)} chunks so far)")
+                    print(f"[ingestor]   {i}/{total} pages, {len(all_chunks)} chunks")
 
         print(f"[ingestor] Done. Total chunks: {len(all_chunks)}")
         return all_chunks

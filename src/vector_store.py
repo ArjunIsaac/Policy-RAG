@@ -1,11 +1,8 @@
 """
 vector_store.py
 ---------------
-Manages embedding creation, ChromaDB indexing, and retrieval.
-
-Embedding model : nomic-embed-text via Ollama  (runs locally, no API key needed)
-Vector store    : ChromaDB with persistence
-Search strategy : hybrid — dense similarity + keyword-tag pre-filter
+ChromaDB + LangChain vector store for insurance policy RAG.
+Compatible with chromadb >=1.0 and langchain-chroma >=0.2.
 """
 
 from __future__ import annotations
@@ -17,55 +14,31 @@ from typing import Any
 
 import chromadb
 from chromadb.config import Settings
-from langchain_ollama import OllamaEmbeddings
 from langchain_chroma import Chroma
+from langchain_ollama import OllamaEmbeddings
 
 from ingestor import Chunk
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
 COLLECTION_NAME = "insurance_policies"
-EMBED_MODEL = "nomic-embed-text"   # pull with: ollama pull nomic-embed-text
-DEFAULT_K = 6                       # chunks returned per query
+EMBED_MODEL = "nomic-embed-text"
+DEFAULT_K = 6
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def _chunk_id(chunk: Chunk) -> str:
-    """Deterministic ID so re-ingestion is idempotent."""
-    key = f"{chunk.metadata['source']}::p{chunk.metadata['page']}::{chunk.text[:80]}"
-    return hashlib.md5(key.encode()).hexdigest()
+    # Hash the FULL text so chunks that share an 80-char prefix get distinct IDs
+    key = f"{chunk.metadata['source']}::p{chunk.metadata['page']}::l{chunk.metadata.get('line', 0)}::{chunk.text}"
+    return hashlib.sha256(key.encode()).hexdigest()[:32]
 
-
-def _build_where_filter(tags: list[str]) -> dict | None:
-    """
-    Build a ChromaDB metadata $contains-style filter for insurance tags.
-    Returns None when no tags are detected (no filter applied).
-    """
-    if not tags:
-        return None
-    # ChromaDB supports $or across metadata array fields via $contains
-    # We store tags as a JSON string and fall back to text search otherwise.
-    return None  # See retrieval note in `similarity_search_with_filter`
-
-
-# ---------------------------------------------------------------------------
-# Main class
-# ---------------------------------------------------------------------------
 
 class PolicyVectorStore:
     """
-    Wraps ChromaDB + LangChain Chroma for the insurance RAG pipeline.
+    Wraps ChromaDB + LangChain Chroma.
 
     Usage
     -----
-    store = PolicyVectorStore(persist_dir="data/chroma_db")
-    store.add_chunks(chunks)          # index new chunks
-    results = store.retrieve("what is the waiting period?")
+    store = PolicyVectorStore()
+    store.add_chunks(chunks)
+    results = store.retrieve("waiting period?")
     """
 
     def __init__(
@@ -76,76 +49,71 @@ class PolicyVectorStore:
     ) -> None:
         self.persist_dir = Path(persist_dir)
         self.persist_dir.mkdir(parents=True, exist_ok=True)
+        self.collection_name = collection_name
 
-        print(f"[vector_store] Initialising embeddings with '{embed_model}' …")
+        print(f"[vector_store] Initialising embeddings ({embed_model}) …")
         self.embeddings = OllamaEmbeddings(model=embed_model)
 
-        # Raw ChromaDB client for admin operations (e.g. checking existing IDs)
         self._client = chromadb.PersistentClient(
             path=str(self.persist_dir),
             settings=Settings(anonymized_telemetry=False),
         )
 
-        # LangChain-wrapped Chroma for retriever convenience
         self._vectorstore = Chroma(
             client=self._client,
             collection_name=collection_name,
             embedding_function=self.embeddings,
         )
-
         print("[vector_store] Ready.")
 
     # ------------------------------------------------------------------
     # Indexing
     # ------------------------------------------------------------------
 
-    def add_chunks(self, chunks: list[Chunk], batch_size: int = 64) -> int:
-        """
-        Add *chunks* to the vector store.  Skips chunks that are already
-        present (idempotent based on content hash).
-
-        Returns the number of *new* chunks actually added.
-        """
+    def add_chunks(self, chunks: list[Chunk], batch_size: int = 32) -> int:
         if not chunks:
-            print("[vector_store] No chunks to add.")
             return 0
 
-        # Fetch existing IDs to avoid duplicates
-        existing = set(
-            self._client.get_collection(
-                self._vectorstore._collection.name
-            ).get(include=[])["ids"]
-        )
+        # Fetch existing IDs
+        try:
+            col = self._client.get_collection(self.collection_name)
+            existing = set(col.get(include=[])["ids"])
+        except Exception:
+            existing = set()
 
         texts, metadatas, ids = [], [], []
+        seen_this_batch: set[str] = set()   # guard against duplicates within the batch
         for chunk in chunks:
             cid = _chunk_id(chunk)
-            if cid in existing:
+            if cid in existing or cid in seen_this_batch:
                 continue
-            # Serialise tags list → string so ChromaDB can store it
-            meta = {**chunk.metadata, "tags": json.dumps(chunk.metadata.get("tags", []))}
+            seen_this_batch.add(cid)
+            meta = {
+                **chunk.metadata,
+                "tags": json.dumps(chunk.metadata.get("tags", [])),
+                "clause": chunk.metadata.get("clause", ""),
+            }
             texts.append(chunk.text)
             metadatas.append(meta)
             ids.append(cid)
 
         if not texts:
-            print("[vector_store] All chunks already indexed — nothing to add.")
+            print("[vector_store] All chunks already indexed.")
             return 0
 
-        total_new = len(texts)
-        print(f"[vector_store] Embedding {total_new} new chunks …")
-
-        for start in range(0, total_new, batch_size):
+        total = len(texts)
+        print(f"[vector_store] Embedding {total} new chunks …")
+        for start in range(0, total, batch_size):
             end = start + batch_size
             self._vectorstore.add_texts(
                 texts=texts[start:end],
                 metadatas=metadatas[start:end],
                 ids=ids[start:end],
             )
-            print(f"[vector_store]   {min(end, total_new)}/{total_new} done")
+            print(f"[vector_store]   {min(end, total)}/{total}")
 
-        print(f"[vector_store] Indexed {total_new} new chunks.")
-        return total_new
+        print(f"[vector_store] Indexed {total} chunks.")
+        return total
 
     # ------------------------------------------------------------------
     # Retrieval
@@ -155,52 +123,47 @@ class PolicyVectorStore:
         self,
         query: str,
         k: int = DEFAULT_K,
-        source_filter: str | None = None,
+        source_filter: list[str] | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Retrieve the top-*k* most relevant chunks for *query*.
-
-        Parameters
-        ----------
-        query         : natural language question
-        k             : number of results to return
-        source_filter : if set, restrict to chunks from this PDF filename
-
-        Returns
-        -------
-        list of dicts with keys: text, page, source, type, tags, score
+        Returns top-k chunks. source_filter is a list of PDF filenames to
+        restrict retrieval to (None = all sources).
         """
         where: dict | None = None
-        if source_filter:
-            where = {"source": {"$eq": source_filter}}
+        if source_filter and len(source_filter) == 1:
+            where = {"source": {"$eq": source_filter[0]}}
+        elif source_filter and len(source_filter) > 1:
+            where = {"source": {"$in": source_filter}}
 
         results = self._vectorstore.similarity_search_with_relevance_scores(
-            query=query,
-            k=k,
-            filter=where,
+            query=query, k=k, filter=where
         )
 
         output = []
         for doc, score in results:
-            output.append(
-                {
-                    "text": doc.page_content,
-                    "page": doc.metadata.get("page", "?"),
-                    "source": doc.metadata.get("source", "?"),
-                    "type": doc.metadata.get("type", "text"),
-                    "tags": json.loads(doc.metadata.get("tags", "[]")),
-                    "score": round(score, 4),
-                }
-            )
+            output.append({
+                "text": doc.page_content,
+                "page": doc.metadata.get("page", "?"),
+                "line": doc.metadata.get("line", "?"),
+                "clause": doc.metadata.get("clause", ""),
+                "source": doc.metadata.get("source", "?"),
+                "type": doc.metadata.get("type", "text"),
+                "tags": json.loads(doc.metadata.get("tags", "[]")),
+                "score": round(score, 4),
+            })
         return output
 
-    def as_retriever(self, k: int = DEFAULT_K, source_filter: str | None = None):
-        """
-        Return a LangChain-compatible retriever object for use in chains.
-        """
+    def as_retriever(
+        self,
+        k: int = DEFAULT_K,
+        source_filter: list[str] | None = None,
+    ):
+        """LangChain-compatible retriever."""
         search_kwargs: dict[str, Any] = {"k": k}
-        if source_filter:
-            search_kwargs["filter"] = {"source": {"$eq": source_filter}}
+        if source_filter and len(source_filter) == 1:
+            search_kwargs["filter"] = {"source": {"$eq": source_filter[0]}}
+        elif source_filter and len(source_filter) > 1:
+            search_kwargs["filter"] = {"source": {"$in": source_filter}}
         return self._vectorstore.as_retriever(search_kwargs=search_kwargs)
 
     # ------------------------------------------------------------------
@@ -208,11 +171,27 @@ class PolicyVectorStore:
     # ------------------------------------------------------------------
 
     def list_sources(self) -> list[str]:
-        """Return unique PDF filenames currently in the store."""
-        col = self._client.get_collection(self._vectorstore._collection.name)
-        all_meta = col.get(include=["metadatas"])["metadatas"]
-        return sorted({m.get("source", "") for m in all_meta if m})
+        try:
+            col = self._client.get_collection(self.collection_name)
+            all_meta = col.get(include=["metadatas"])["metadatas"]
+            return sorted({m.get("source", "") for m in all_meta if m})
+        except Exception:
+            return []
 
     def count(self) -> int:
-        """Total number of chunks in the store."""
-        return self._vectorstore._collection.count()
+        try:
+            return self._vectorstore._collection.count()
+        except Exception:
+            return 0
+
+    def delete_source(self, source_name: str) -> None:
+        """Remove all chunks belonging to a specific PDF."""
+        try:
+            col = self._client.get_collection(self.collection_name)
+            result = col.get(where={"source": {"$eq": source_name}}, include=[])
+            ids = result.get("ids", [])
+            if ids:
+                col.delete(ids=ids)
+                print(f"[vector_store] Deleted {len(ids)} chunks for '{source_name}'")
+        except Exception as e:
+            print(f"[vector_store] Could not delete '{source_name}': {e}")
