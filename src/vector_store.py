@@ -2,7 +2,7 @@
 vector_store.py
 ---------------
 ChromaDB + LangChain vector store for insurance policy RAG.
-Compatible with chromadb >=1.0 and langchain-chroma >=0.2.
+Now supports hybrid search with configurable search type and BM25 weights.
 """
 
 from __future__ import annotations
@@ -16,31 +16,24 @@ import chromadb
 from chromadb.config import Settings
 from langchain_chroma import Chroma
 from langchain_ollama import OllamaEmbeddings
+from langchain_community.retrievers import BM25Retriever
+from langchain_classic.retrievers import EnsembleRetriever
+from langchain_core.documents import Document
 
-from ingestor import Chunk
+from datatypes import Chunk
 
 COLLECTION_NAME = "insurance_policies"
 EMBED_MODEL = "nomic-embed-text"
-DEFAULT_K = 6
-
+HYBRID_FETCH_K = 20  # This is overridden in chain.py
 
 def _chunk_id(chunk: Chunk) -> str:
-    # Hash the FULL text so chunks that share an 80-char prefix get distinct IDs
-    key = f"{chunk.metadata['source']}::p{chunk.metadata['page']}::l{chunk.metadata.get('line', 0)}::{chunk.text}"
+    key = (
+        f"{chunk.metadata['source']}::p{chunk.metadata['page']}"
+        f"::h{chunk.metadata.get('heading', '')}::{chunk.text}"
+    )
     return hashlib.sha256(key.encode()).hexdigest()[:32]
 
-
 class PolicyVectorStore:
-    """
-    Wraps ChromaDB + LangChain Chroma.
-
-    Usage
-    -----
-    store = PolicyVectorStore()
-    store.add_chunks(chunks)
-    results = store.retrieve("waiting period?")
-    """
-
     def __init__(
         self,
         persist_dir: str | Path = "data/chroma_db",
@@ -58,7 +51,6 @@ class PolicyVectorStore:
             path=str(self.persist_dir),
             settings=Settings(anonymized_telemetry=False),
         )
-
         self._vectorstore = Chroma(
             client=self._client,
             collection_name=collection_name,
@@ -66,15 +58,10 @@ class PolicyVectorStore:
         )
         print("[vector_store] Ready.")
 
-    # ------------------------------------------------------------------
-    # Indexing
-    # ------------------------------------------------------------------
-
     def add_chunks(self, chunks: list[Chunk], batch_size: int = 32) -> int:
         if not chunks:
             return 0
 
-        # Fetch existing IDs
         try:
             col = self._client.get_collection(self.collection_name)
             existing = set(col.get(include=[])["ids"])
@@ -82,7 +69,8 @@ class PolicyVectorStore:
             existing = set()
 
         texts, metadatas, ids = [], [], []
-        seen_this_batch: set[str] = set()   # guard against duplicates within the batch
+        seen_this_batch: set[str] = set()
+
         for chunk in chunks:
             cid = _chunk_id(chunk)
             if cid in existing or cid in seen_this_batch:
@@ -92,6 +80,8 @@ class PolicyVectorStore:
                 **chunk.metadata,
                 "tags": json.dumps(chunk.metadata.get("tags", [])),
                 "clause": chunk.metadata.get("clause", ""),
+                "heading": chunk.metadata.get("heading", ""),
+                "parent_text": chunk.metadata.get("parent_text", chunk.text),
             }
             texts.append(chunk.text)
             metadatas.append(meta)
@@ -115,60 +105,83 @@ class PolicyVectorStore:
         print(f"[vector_store] Indexed {total} chunks.")
         return total
 
-    # ------------------------------------------------------------------
-    # Retrieval
-    # ------------------------------------------------------------------
-
-    def retrieve(
+    def as_hybrid_retriever(
         self,
-        query: str,
-        k: int = DEFAULT_K,
+        k: int = HYBRID_FETCH_K,
         source_filter: list[str] | None = None,
-    ) -> list[dict[str, Any]]:
-        """
-        Returns top-k chunks. source_filter is a list of PDF filenames to
-        restrict retrieval to (None = all sources).
-        """
+        search_type: str = "mmr"
+    ):
+        """Return a hybrid retriever (vector + BM25)."""
+        search_kwargs: dict[str, Any] = {"k": k}
+        where = None
+        
+        if source_filter and len(source_filter) == 1:
+            where = {"source": {"$eq": source_filter[0]}}
+        elif source_filter and len(source_filter) > 1:
+            where = {"source": {"$in": source_filter}}
+            
+        if where:
+            search_kwargs["filter"] = where
+
+        # 1. Vector Retriever
+        if search_type == "mmr":
+            vector_retriever = self._vectorstore.as_retriever(
+                search_type="mmr",
+                search_kwargs={**search_kwargs, "fetch_k": k * 2, "lambda_mult": 0.8}
+            )
+        else:
+            vector_retriever = self._vectorstore.as_retriever(
+                search_type="similarity",
+                search_kwargs=search_kwargs
+            )
+
+        # 2. BM25 Retriever
+        try:
+            col = self._client.get_collection(self.collection_name)
+            chroma_data = col.get(where=where) if where else col.get()
+            
+            docs = []
+            for text, meta in zip(chroma_data['documents'], chroma_data['metadatas']):
+                docs.append(Document(page_content=text, metadata=meta))
+                
+            if docs:
+                bm25_retriever = BM25Retriever.from_documents(docs)
+                bm25_retriever.k = k
+                
+                # 3. Combine them – favour BM25 for exact matches
+                ensemble_retriever = EnsembleRetriever(
+                    retrievers=[vector_retriever, bm25_retriever], 
+                    weights=[0.3, 0.7]   # BM25 70%, vector 30%
+                )
+                return ensemble_retriever
+            else:
+                print("[vector_store] No documents for BM25, using vector only")
+                return vector_retriever
+        except Exception as e:
+            print(f"[vector_store] BM25 setup failed, falling back to Vector. Error: {e}")
+            return vector_retriever
+
+    def retrieve(self, query: str, k: int = 10, source_filter: list[str] | None = None) -> list[dict[str, Any]]:
         where: dict | None = None
         if source_filter and len(source_filter) == 1:
             where = {"source": {"$eq": source_filter[0]}}
         elif source_filter and len(source_filter) > 1:
             where = {"source": {"$in": source_filter}}
 
-        results = self._vectorstore.similarity_search_with_relevance_scores(
-            query=query, k=k, filter=where
-        )
-
+        results = self._vectorstore.similarity_search_with_relevance_scores(query=query, k=k, filter=where)
         output = []
         for doc, score in results:
             output.append({
                 "text": doc.page_content,
+                "parent_text": doc.metadata.get("parent_text", doc.page_content),
                 "page": doc.metadata.get("page", "?"),
                 "line": doc.metadata.get("line", "?"),
                 "clause": doc.metadata.get("clause", ""),
+                "heading": doc.metadata.get("heading", ""),
                 "source": doc.metadata.get("source", "?"),
-                "type": doc.metadata.get("type", "text"),
-                "tags": json.loads(doc.metadata.get("tags", "[]")),
                 "score": round(score, 4),
             })
         return output
-
-    def as_retriever(
-        self,
-        k: int = DEFAULT_K,
-        source_filter: list[str] | None = None,
-    ):
-        """LangChain-compatible retriever."""
-        search_kwargs: dict[str, Any] = {"k": k}
-        if source_filter and len(source_filter) == 1:
-            search_kwargs["filter"] = {"source": {"$eq": source_filter[0]}}
-        elif source_filter and len(source_filter) > 1:
-            search_kwargs["filter"] = {"source": {"$in": source_filter}}
-        return self._vectorstore.as_retriever(search_kwargs=search_kwargs)
-
-    # ------------------------------------------------------------------
-    # Utility
-    # ------------------------------------------------------------------
 
     def list_sources(self) -> list[str]:
         try:
@@ -180,18 +193,6 @@ class PolicyVectorStore:
 
     def count(self) -> int:
         try:
-            return self._vectorstore._collection.count()
+            return self._client.get_collection(self.collection_name).count()
         except Exception:
             return 0
-
-    def delete_source(self, source_name: str) -> None:
-        """Remove all chunks belonging to a specific PDF."""
-        try:
-            col = self._client.get_collection(self.collection_name)
-            result = col.get(where={"source": {"$eq": source_name}}, include=[])
-            ids = result.get("ids", [])
-            if ids:
-                col.delete(ids=ids)
-                print(f"[vector_store] Deleted {len(ids)} chunks for '{source_name}'")
-        except Exception as e:
-            print(f"[vector_store] Could not delete '{source_name}': {e}")

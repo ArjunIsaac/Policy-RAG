@@ -5,6 +5,7 @@ Streamlit UI with:
   • Per-policy attribute extraction dashboard
   • Side-by-side policy comparison
   • Conversation loop with page + line citations
+  • Debug retrieval tool
 """
 
 from __future__ import annotations
@@ -117,6 +118,7 @@ def _init():
         "selected_sources": [],
         "extracted_attrs": {},   # {source_name: dict}
         "compare_mode": False,
+        "debug_output": "",      # store debug result
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -282,6 +284,26 @@ with st.sidebar:
         if st.session_state.chain:
             st.session_state.chain.reset_memory()
         st.rerun()
+
+    # ------------------------------------------------------------------
+    # DEBUG SECTION (new)
+    # ------------------------------------------------------------------
+    st.divider()
+    with st.expander("🔍 Debug Retrieval", expanded=False):
+        debug_q = st.text_input("Enter a question to debug:", key="debug_question")
+        if st.button("Run Debug", use_container_width=True, key="debug_run"):
+            if st.session_state.chain is None:
+                st.warning("No chain loaded. Please select a policy first.")
+            elif not debug_q.strip():
+                st.warning("Please enter a question.")
+            else:
+                with st.spinner("Running debug... (check terminal for detailed logs)"):
+                    # Call debug method and get the output string
+                    debug_output = st.session_state.chain.debug_retrieval(debug_q)
+                    st.session_state.debug_output = debug_output
+                    st.success("Debug complete. See terminal and the code block below.")
+        if st.session_state.debug_output:
+            st.code(st.session_state.debug_output, language="text")
 
 # ---------------------------------------------------------------------------
 # Main area — tabs
