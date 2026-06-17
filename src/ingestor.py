@@ -35,7 +35,7 @@ def _tags(text: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 class PDFIngestor:
-    def __init__(self, chunk_size: int = 1000, overlap: int = 200):
+    def __init__(self, chunk_size: int = 1200, overlap: int = 200):
         # Markdown splitter keeps contextual headers attached to the chunks
         self.md_splitter = MarkdownHeaderTextSplitter(
             headers_to_split_on=[

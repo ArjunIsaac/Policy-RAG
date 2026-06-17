@@ -23,7 +23,7 @@ from langchain_core.documents import Document
 from datatypes import Chunk
 
 COLLECTION_NAME = "insurance_policies"
-EMBED_MODEL = "nomic-embed-text"
+EMBED_MODEL = "bge-m3"
 HYBRID_FETCH_K = 20  # This is overridden in chain.py
 
 def _chunk_id(chunk: Chunk) -> str:

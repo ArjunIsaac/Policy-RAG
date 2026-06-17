@@ -120,7 +120,7 @@ class PolicyChain:
 
     def _get_cross_encoder(self) -> CrossEncoder:
         if self._cross_encoder is None:
-            print("[chain] Loading CrossEncoder …")
+            print("[chain] Loading CrossEncoder…")
             sys.stdout.flush()
             self._cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
         return self._cross_encoder

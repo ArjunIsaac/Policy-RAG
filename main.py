@@ -223,7 +223,7 @@ with st.sidebar:
 
         if st.button("⚡ Index uploaded PDFs", use_container_width=True):
             store = get_store()
-            ingestor = PDFIngestor(chunk_size=500, overlap=100)
+            ingestor = PDFIngestor(chunk_size=1200, overlap=200)
             total_added = 0
             prog = st.progress(0, text="Indexing …")
             for idx, fp in enumerate(new_files):
