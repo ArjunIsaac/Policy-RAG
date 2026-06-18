@@ -422,6 +422,18 @@ with tab_attrs:
                                     ATTR_LABELS.get(key, key),
                                     cached.get(key),
                                 )
+                    # Dynamic / policy-specific attributes
+                    dynamic = cached.get("_dynamic", {})
+                    if dynamic:
+                        st.markdown(
+                            '<div class="section-header">Policy-Specific Features</div>',
+                            unsafe_allow_html=True,
+                        )
+                        cols = st.columns(min(len(dynamic), 3))
+                        for i, (key, val) in enumerate(dynamic.items()):
+                            with cols[i % min(len(dynamic), 3)]:
+                                _attr_card(key.replace("_", " ").title(), val)
+
             else:
                 st.caption("Click **Extract attributes** to auto-analyse this policy.")
 

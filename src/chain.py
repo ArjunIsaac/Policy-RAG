@@ -62,32 +62,75 @@ _PROMPT = ChatPromptTemplate.from_messages([
 # ---------------------------------------------------------------------------
 
 _EXTRACT_GROUPS = [
-    (["policy_name", "insurer", "sum_insured", "renewal_type", "network_hospitals"],
-     "policy name insurer sum insured options network hospitals renewal"),
-    (["waiting_period_initial", "waiting_period_ped", "waiting_period_specific"],
-     "waiting period initial pre-existing disease specific illness days"),
-    (["copay_percentage", "copay_conditions"],
-     "co-payment co-pay percentage non-network hospital conditions"),
-    (["room_rent_sublimit", "icu_sublimit"],
-     "room rent sub-limit per day ICU charges"),
-    (["maternity_covered", "daycare_procedures", "ncb_benefit", "grace_period_days"],
-     "maternity day care no claim bonus NCB grace period renewal"),
-    (["exclusions_permanent"],
-     "permanent exclusions not covered diseases conditions"),
+    (
+        ["policy_name", "insurer", "sum_insured", "renewal_type", "network_hospitals"],
+        "product name total health plan HDFC ERGO insurer sum insured options lakhs network hospitals",
+        {
+            "policy_name": "string - the product/plan name e.g. Total Health Plan",
+            "insurer": "string - the insurance company name",
+            "sum_insured": "array of strings - all sum insured amounts mentioned e.g. 5 Lakhs",
+            "renewal_type": "string - renewal conditions e.g. Lifetime renewable",
+            "network_hospitals": "string - count or description of network hospitals",
+        }
+    ),
+    (
+        ["waiting_period_initial", "waiting_period_ped", "waiting_period_specific"],
+        "30 day waiting period pre-existing disease PED 48 months specific illness 24 months waiting",
+        {
+            "waiting_period_initial": "number - initial waiting period in days e.g. 30",
+            "waiting_period_ped": "string - pre-existing disease waiting period e.g. 48 months",
+            "waiting_period_specific": "string - specific illness waiting period e.g. 24 months",
+        }
+    ),
+    (
+        ["copay_percentage", "copay_conditions"],
+        "co-payment copay percentage insured bear cost sharing non-network",
+        {
+            "copay_percentage": "number or null - co-pay percentage if mentioned e.g. 20",
+            "copay_conditions": "string - conditions under which co-pay applies or null",
+        }
+    ),
+    (
+        ["room_rent_sublimit", "icu_sublimit"],
+        "room rent sub-limit per day ICU intensive care unit charges cap",
+        {
+            "room_rent_sublimit": "string - room rent limit per day or null if no limit",
+            "icu_sublimit": "string - ICU charges limit or null if no limit",
+        }
+    ),
+    (
+        ["maternity_covered", "daycare_procedures", "ncb_benefit", "grace_period_days"],
+        "maternity childbirth delivery day care no claim bonus NCB cumulative bonus grace period renewal",
+        {
+            "maternity_covered": "boolean - true if maternity is covered",
+            "daycare_procedures": "boolean - true if day care procedures are covered",
+            "ncb_benefit": "string - no claim bonus description",
+            "grace_period_days": "number - grace period in days e.g. 30",
+        }
+    ),
+    (
+        ["exclusions_permanent"],
+        "permanent exclusions not covered excluded diseases conditions list war cosmetic",
+        {
+            "exclusions_permanent": "array of strings - list of permanently excluded conditions",
+        }
+    ),
 ]
-
-_EXTRACT_SYSTEM = """You are an insurance data extractor. Extract ONLY the \
-requested fields from the context. Return valid JSON with no markdown fences. \
-Use null for fields not found.
-
-Fields: {fields}
-Context: {context}
-JSON:"""
 
 def _strip_fences(raw: str) -> str:
     raw = raw.strip()
+    # Remove markdown fences
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
-    raw = re.sub(r"\s*\n```$", "", raw)  # Fixed: escaped newline and closed string
+    raw = re.sub(r"\s*```$", "", raw)
+    raw = raw.strip()
+    # If there's text before the first {, strip it
+    brace = raw.find("{")
+    if brace > 0:
+        raw = raw[brace:]
+    # If there's text after the last }, strip it
+    end_brace = raw.rfind("}")
+    if end_brace != -1 and end_brace < len(raw) - 1:
+        raw = raw[:end_brace + 1]
     return raw.strip()
 
 # ---------------------------------------------------------------------------
@@ -393,12 +436,39 @@ class PolicyChain:
 
         return {"answer": answer, "sources": sources}
 
+    def _llm_extract_json(self, fields: list, field_hints: dict, context: str) -> dict:
+        """Call LLM to extract a set of fields from context, return dict."""
+        hints_str = "\n".join(f"  - {k}: {v}" for k, v in field_hints.items())
+        system_msg = SystemMessage(content=(
+            "You are a JSON extractor for insurance policies. "
+            "Respond with ONLY a valid JSON object. No explanation, no markdown, no code fences."
+        ))
+        user_msg = HumanMessage(content=(
+            f"Extract these fields from the insurance policy text.\n"
+            f"Field definitions:\n{hints_str}\n\n"
+            f"Rules:\n"
+            f"- Return ONLY a JSON object with keys: {json.dumps(fields)}\n"
+            f"- Use null for fields not found in the text\n"
+            f"- Do not infer or guess values not explicitly stated\n\n"
+            f"Policy text:\n{context}\n\nJSON:"
+        ))
+        raw = self._parser.invoke(self._llm.invoke([system_msg, user_msg]))
+        raw = _strip_fences(raw)
+        try:
+            result = json.loads(raw)
+            if isinstance(result, dict):
+                return result
+        except json.JSONDecodeError as e:
+            print(f"[chain] JSON parse error: {e} | raw: {raw[:300]}")
+        return {f: None for f in fields}
+
     def extract_attributes(self, source_filter: list[str] | None = None) -> dict:
         merged = {}
         sf = source_filter or self._source_filter
 
-        for fields, query in _EXTRACT_GROUPS:
-            results = self._store.retrieve(query=query, k=8, source_filter=sf)
+        # Step 1: Extract predefined fields
+        for fields, query, field_hints in _EXTRACT_GROUPS:
+            results = self._store.retrieve(query=query, k=4, source_filter=sf)
             if not results:
                 for f in fields:
                     merged[f] = None
@@ -406,32 +476,59 @@ class PolicyChain:
 
             context_parts = []
             for r in results:
-                parent = r.get("parent_text", r["text"])
-                context_parts.append(f"[Page {r['page']} | {r.get('heading','')}]\n{parent}")
-            context = "\n\n---\n\n".join(context_parts)
+                text = r["text"][:600]
+                context_parts.append(f"[Page {r['page']}]\n{text}")
+            context = "\n---\n".join(context_parts)
 
-            prompt = _EXTRACT_SYSTEM.format(
-                fields=json.dumps(fields),
-                context=context,
-            )
-            raw = self._parser.invoke(
-                self._llm.invoke([SystemMessage(content=prompt)])
-            )
-            raw = _strip_fences(raw)
+            group_data = self._llm_extract_json(fields, field_hints, context)
+            merged.update(group_data)
 
-            try:
-                group_data = json.loads(raw)
-                if isinstance(group_data, dict):
-                    merged.update(group_data)
-                else:
-                    for f in fields:
-                        merged[f] = None
-            except json.JSONDecodeError:
-                for f in fields:
-                    merged.setdefault(f, None)
-                merged.setdefault("_parse_errors", []).append(raw[:200])
+        # Step 2: Discover policy-specific dynamic attributes
+        dynamic = self._discover_dynamic_attributes(sf)
+        if dynamic:
+            merged["_dynamic"] = dynamic
 
         return merged
+
+    def _discover_dynamic_attributes(self, source_filter: list[str] | None) -> dict:
+        """Ask the LLM to identify any unique/notable attributes specific to this policy."""
+        queries = [
+            "unique benefits special features multiplier bonus health checkup",
+            "deductible sub-limit specific coverage restore benefit",
+            "free look period moratorium portability migration",
+        ]
+        context_parts = []
+        for q in queries:
+            results = self._store.retrieve(query=q, k=2, source_filter=source_filter)
+            for r in results:
+                context_parts.append(f"[Page {r['page']}]\n{r['text'][:400]}")
+
+        if not context_parts:
+            return {}
+
+        context = "\n---\n".join(context_parts[:6])
+        system_msg = SystemMessage(content=(
+            "You are an insurance policy analyst. "
+            "Respond with ONLY a valid JSON object. No explanation, no markdown."
+        ))
+        user_msg = HumanMessage(content=(
+            "Read this insurance policy text and identify any notable attributes "
+            "that are SPECIFIC or UNIQUE to this policy — things not commonly found in all policies, "
+            "such as special riders, unique benefits, restore features, multiplier benefits, "
+            "free look period, moratorium period, or any other standout features.\n\n"
+            "Return a JSON object where keys are short attribute names (snake_case) "
+            "and values are brief descriptions. Return empty object {} if nothing notable found.\n\n"
+            f"Policy text:\n{context}\n\nJSON:"
+        ))
+        raw = self._parser.invoke(self._llm.invoke([system_msg, user_msg]))
+        raw = _strip_fences(raw)
+        try:
+            result = json.loads(raw)
+            if isinstance(result, dict):
+                return result
+        except json.JSONDecodeError as e:
+            print(f"[chain] Dynamic attributes parse error: {e} | raw: {raw[:200]}")
+        return {}
 
     def reset_memory(self) -> None:
         self._history.clear()
