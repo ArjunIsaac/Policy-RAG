@@ -45,21 +45,33 @@ QUICK_QUESTIONS = [
 ATTR_LABELS: dict[str, str] = {
     "policy_name": "Policy Name",
     "insurer": "Insurer",
-    "sum_insured": "Sum Insured Options",
-    "waiting_period_initial": "Initial Waiting Period (days)",
-    "waiting_period_ped": "PED Waiting Period (days)",
-    "waiting_period_specific": "Specific Illness Waiting Period (days)",
+    "sum_insured_options": "Sum Insured Options",
+    "policy_tenure": "Policy Tenure",
+    "lifetime_renewability": "Lifetime Renewable",
+    "free_look_period_days": "Free Look Period (days)",
+    "grace_period_days": "Grace Period (days)",
+    "waiting_period_initial_days": "Initial Waiting Period (days)",
+    "waiting_period_ped_months": "PED Waiting Period (months)",
+    "waiting_period_specific_illness_months": "Specific Illness Waiting Period (months)",
+    "copay_applicable": "Co-pay Applicable",
     "copay_percentage": "Co-pay %",
     "copay_conditions": "Co-pay Conditions",
     "room_rent_sublimit": "Room Rent Sub-limit",
     "icu_sublimit": "ICU Sub-limit",
+    "inpatient_covered": "Inpatient Cover",
+    "daycare_covered": "Day Care Procedures",
+    "domiciliary_covered": "Domiciliary Treatment",
     "maternity_covered": "Maternity Covered",
-    "daycare_procedures": "Day Care Procedures",
-    "exclusions_permanent": "Permanent Exclusions",
-    "grace_period_days": "Grace Period (days)",
-    "renewal_type": "Renewal Type",
-    "ncb_benefit": "No Claim Bonus",
+    "ambulance_covered": "Emergency Ambulance",
+    "organ_donor_covered": "Organ Donor Cover",
+    "pre_hospitalisation_days": "Pre-Hospitalisation (days)",
+    "post_hospitalisation_days": "Post-Hospitalisation (days)",
+    "cashless_available": "Cashless Facility",
     "network_hospitals": "Network Hospitals",
+    "claim_settlement_days": "Claim Settlement (days)",
+    "portability_available": "Portability",
+    "ncb_benefit": "No Claim Bonus",
+    "permanent_exclusions": "Permanent Exclusions",
 }
 
 # ---------------------------------------------------------------------------
@@ -358,13 +370,59 @@ with tab_chat:
         st.rerun()
 
     # Input
+    # Input - Streaming version
     if store.count() == 0:
         st.warning("Index at least one PDF using the sidebar to start asking questions.")
     else:
         user_input = st.chat_input("Ask anything about the selected policy/policies …")
         if user_input:
-            _run_query(user_input)
-            st.rerun()
+            # Add user message to history
+            st.session_state.messages.append({"role": "user", "content": user_input})
+            
+            # Get chain
+            chain = st.session_state.chain
+            
+            if chain is None:
+                st.warning("Please select at least one policy from the sidebar first.")
+                st.session_state.messages.pop()  # Remove user message
+            else:
+                # Show assistant response with streaming
+                with st.chat_message("assistant"):
+                    response_placeholder = st.empty()
+                    full_response = ""
+                    sources = []
+                    
+                    try:
+                        # Stream the response
+                        for chunk in chain.ask_stream(user_input):
+                            if chunk["type"] == "text":
+                                full_response += chunk["content"]
+                                # Update placeholder with streaming text and cursor
+                                response_placeholder.markdown(full_response + "▌")
+                            elif chunk["type"] == "sources":
+                                sources = chunk["sources"]
+                        
+                        # Final response without cursor
+                        response_placeholder.markdown(full_response)
+                        
+                        # Add to history
+                        st.session_state.messages.append({
+                            "role": "assistant",
+                            "content": full_response,
+                            "sources": sources,
+                        })
+                        
+                        # Show citations
+                        if sources:
+                            st.markdown(_citation_badges(sources), unsafe_allow_html=True)
+                            
+                    except Exception as e:
+                        st.error(f"Error: {str(e)}")
+                        # Remove the user message if failed
+                        if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
+                            st.session_state.messages.pop()
+                    
+                    st.rerun()
 
 # ===========================================================================
 # TAB 2 — POLICY ATTRIBUTES
@@ -393,21 +451,31 @@ with tab_attrs:
                     with st.expander("Raw LLM output (JSON parse failed)"):
                         st.code(cached.get("_raw", ""))
                 else:
-                    # Group into sections
-                    waiting = ["waiting_period_initial", "waiting_period_ped", "waiting_period_specific"]
-                    copay   = ["copay_percentage", "copay_conditions"]
-                    limits  = ["room_rent_sublimit", "icu_sublimit"]
-                    cover   = ["maternity_covered", "daycare_procedures", "sum_insured", "network_hospitals"]
-                    policy  = ["policy_name", "insurer", "renewal_type", "grace_period_days", "ncb_benefit"]
-                    excl    = ["exclusions_permanent"]
-
                     sections = {
-                        "Policy Overview": policy,
-                        "Waiting Periods": waiting,
-                        "Co-pay": copay,
-                        "Sub-limits": limits,
-                        "Coverage": cover,
-                        "Permanent Exclusions": excl,
+                        "Policy Overview": [
+                            "policy_name", "insurer", "sum_insured_options",
+                            "policy_tenure", "lifetime_renewability",
+                            "free_look_period_days", "grace_period_days",
+                        ],
+                        "Waiting Periods": [
+                            "waiting_period_initial_days",
+                            "waiting_period_ped_months",
+                            "waiting_period_specific_illness_months",
+                        ],
+                        "Co-pay & Sub-limits": [
+                            "copay_applicable", "copay_percentage",
+                            "copay_conditions", "room_rent_sublimit", "icu_sublimit",
+                        ],
+                        "Coverage": [
+                            "inpatient_covered", "daycare_covered", "domiciliary_covered",
+                            "maternity_covered", "ambulance_covered", "organ_donor_covered",
+                            "pre_hospitalisation_days", "post_hospitalisation_days",
+                        ],
+                        "Claims & Renewals": [
+                            "cashless_available", "network_hospitals",
+                            "claim_settlement_days", "portability_available", "ncb_benefit",
+                        ],
+                        "Permanent Exclusions": ["permanent_exclusions"],
                     }
 
                     for section_title, keys in sections.items():
@@ -422,7 +490,8 @@ with tab_attrs:
                                     ATTR_LABELS.get(key, key),
                                     cached.get(key),
                                 )
-                    # Dynamic / policy-specific attributes
+
+                    # Dynamic / policy-specific partner-relevant attributes
                     dynamic = cached.get("_dynamic", {})
                     if dynamic:
                         st.markdown(
