@@ -58,80 +58,164 @@ _PROMPT = ChatPromptTemplate.from_messages([
 ])
 
 # ---------------------------------------------------------------------------
-# Attribute extraction groups
+# Attribute extraction — partner-focused, full-document approach
 # ---------------------------------------------------------------------------
 
-_EXTRACT_GROUPS = [
+# Each group: (field_definitions_dict, section_hint_for_llm)
+# Each group: (field_definitions, rag_query, hint)
+_PARTNER_ATTR_GROUPS = [
     (
-        ["policy_name", "insurer", "sum_insured", "renewal_type", "network_hospitals"],
-        "product name total health plan HDFC ERGO insurer sum insured options lakhs network hospitals",
         {
-            "policy_name": "string - the product/plan name e.g. Total Health Plan",
-            "insurer": "string - the insurance company name",
-            "sum_insured": "array of strings - all sum insured amounts mentioned e.g. 5 Lakhs",
-            "renewal_type": "string - renewal conditions e.g. Lifetime renewable",
-            "network_hospitals": "string - count or description of network hospitals",
-        }
+            "policy_name": "string - product/plan name e.g. Total Health Plan",
+            "insurer": "string - insurance company name",
+            "sum_insured_options": "array of strings - all sum insured amounts e.g. ['5 Lakhs','10 Lakhs']",
+            "policy_tenure": "string - policy duration e.g. '1 Year'",
+            "lifetime_renewability": "boolean - true if policy is lifetime renewable",
+            "free_look_period_days": "number - free look period in days e.g. 15",
+            "grace_period_days": "number - grace period for renewal in days e.g. 30",
+        },
+        "Total Health Plan HDFC ERGO sum insured 5 lakhs tenure 1 year free look period 15 days grace period 30 days lifetime renewable",
+        "Look in: product name heading, sum insured table (e.g. 5 Lakhs), tenure (1 Year), renewal clause (lifetime renewable), free look period (15 days from receipt), grace period (30 days after premium due date)."
     ),
     (
-        ["waiting_period_initial", "waiting_period_ped", "waiting_period_specific"],
-        "30 day waiting period pre-existing disease PED 48 months specific illness 24 months waiting",
         {
-            "waiting_period_initial": "number - initial waiting period in days e.g. 30",
-            "waiting_period_ped": "string - pre-existing disease waiting period e.g. 48 months",
-            "waiting_period_specific": "string - specific illness waiting period e.g. 24 months",
-        }
+    "waiting_period_initial_days": "number - initial waiting period in days e.g. 30",
+    "waiting_period_ped_months": "number - pre-existing disease PED waiting period in months e.g. 48",
+    "waiting_period_specific_illness_months": "number - specific illness/procedure waiting period in months e.g. 24",
+},
+"30 day waiting period pre-existing disease PED 48 months continuous coverage specific disease procedure 24 months cataract hernia arthritis",
+"Look in: Section C Waiting Period & Exclusions. Initial waiting period = 30 days. PED (pre-existing disease) = 48 months. Specific disease/procedure waiting = 24 months."
     ),
     (
-        ["copay_percentage", "copay_conditions"],
-        "co-payment copay percentage insured bear cost sharing non-network",
         {
-            "copay_percentage": "number or null - co-pay percentage if mentioned e.g. 20",
-            "copay_conditions": "string - conditions under which co-pay applies or null",
-        }
+            "copay_applicable": "boolean - true if any co-pay clause exists",
+            "copay_percentage": "number or null - co-pay percentage e.g. 20",
+            "copay_conditions": "string or null - exact conditions when co-pay applies",
+            "room_rent_sublimit": "string or null - room rent daily cap e.g. '1% of sum insured'",
+            "icu_sublimit": "string or null - ICU charges cap e.g. '2% of sum insured'",
+        },
+        "copayment co-pay cost sharing room rent sub-limit ICU intensive care unit sub-limit bed charges",
+        "Look in: definition of Copayment, any co-pay clause. If no co-pay % is stated, copay_applicable=false and copay_percentage=null. Room rent and ICU sub-limits: look for daily cap amounts or percentage of sum insured."
     ),
     (
-        ["room_rent_sublimit", "icu_sublimit"],
-        "room rent sub-limit per day ICU intensive care unit charges cap",
         {
-            "room_rent_sublimit": "string - room rent limit per day or null if no limit",
-            "icu_sublimit": "string - ICU charges limit or null if no limit",
-        }
+            "inpatient_covered": "boolean - true if inpatient hospitalisation is covered",
+            "daycare_covered": "boolean - true if day care procedures are covered",
+            "domiciliary_covered": "boolean - true if domiciliary home treatment is covered",
+            "maternity_covered": "boolean - true if maternity expenses are covered",
+            "ambulance_covered": "boolean - true if emergency ambulance is covered",
+            "organ_donor_covered": "boolean - true if organ donor harvesting expenses are covered",
+            "pre_hospitalisation_days": "number - pre-hospitalisation cover in days e.g. 30",
+            "post_hospitalisation_days": "number - post-hospitalisation cover in days e.g. 60",
+        },
+        "inpatient day care domiciliary maternity ambulance organ donor pre-hospitalisation 30 days post-hospitalisation 60 days",
+        "Look in: Section B Benefits - inpatient, day care, domiciliary, maternity, ambulance, organ donor, pre/post hospitalisation days."
     ),
     (
-        ["maternity_covered", "daycare_procedures", "ncb_benefit", "grace_period_days"],
-        "maternity childbirth delivery day care no claim bonus NCB cumulative bonus grace period renewal",
         {
-            "maternity_covered": "boolean - true if maternity is covered",
-            "daycare_procedures": "boolean - true if day care procedures are covered",
-            "ncb_benefit": "string - no claim bonus description",
-            "grace_period_days": "number - grace period in days e.g. 30",
-        }
+            "cashless_available": "boolean - true if cashless facility at network hospitals",
+            "network_hospitals": "string - description or count of network hospitals",
+            "claim_settlement_days": "number - days insurer must settle claim e.g. 30",
+            "portability_available": "boolean - true if policy can be ported to another insurer",
+            "ncb_benefit": "string or null - No Claim Bonus or Cumulative Bonus description",
+        },
+        "cashless facility network provider claim settlement 30 days portability port insurer No Claim Bonus cumulative bonus NCB",
+        "Look in: cashless service clause (available at network hospitals), claim settlement (company must settle within 30 days), portability clause (port to other insurers 45 days before renewal), Cumulative Bonus / No Claim Bonus definition."
     ),
     (
-        ["exclusions_permanent"],
-        "permanent exclusions not covered excluded diseases conditions list war cosmetic",
         {
-            "exclusions_permanent": "array of strings - list of permanently excluded conditions",
-        }
+            "permanent_exclusions": "array of strings - key permanently excluded conditions (max 10)",
+        },
+        "permanent exclusions not covered excluded war cosmetic obesity adventure sports alcohol infertility",
+        "Look in: Section C Standard and Specific General Exclusions. List main permanent exclusions."
     ),
 ]
 
+_DYNAMIC_ATTR_PROMPT = """You are an expert insurance analyst helping insurance PARTNERS pitch policies to clients.
+
+Read this insurance policy and identify ONLY benefits/features that:
+1. Are a SELLING POINT a partner would highlight when pitching to a client
+2. Are PRODUCT FEATURES — not definitions, not exclusions, not admin clauses
+
+ONLY include things like:
+- Restore/Recharge benefit (sum insured restored after a claim)
+- Multiplier / Cumulative bonus (sum insured increases each claim-free year)
+- OPD cover (outpatient consultations covered)
+- Daily hospital cash benefit
+- Newborn baby cover
+- Mental health cover
+- E-opinion / second medical opinion benefit
+- Moratorium period (after X years, no pre-existing disease lookback)
+- International cover
+- Deductible options
+- Health check-up benefit
+- Any rider or add-on benefit
+
+DO NOT include:
+- Medical definitions (e.g. what TIA means, what dialysis means)
+- Exclusions or what is NOT covered
+- Admin clauses (fraud, nomination, cancellation, notices)
+- Anything already captured in standard attributes (waiting periods, co-pay, room rent, maternity, exclusions)
+
+Return a JSON object: keys = short snake_case feature names, values = short description INCLUDING the exact wording found in the policy. 
+CRITICAL RULES:
+
+- NEVER invent a benefit.
+- ONLY return a feature if explicit evidence exists in the supplied text.
+- If the text does not explicitly mention the feature, do not include it.
+- If unsure, omit it.
+- Features must be directly quoted or clearly supported by the text.
+- Return {{}} if no feature is explicitly found.
+
+Policy text:
+{text}
+
+JSON:"""
+
+
 def _strip_fences(raw: str) -> str:
     raw = raw.strip()
-    # Remove markdown fences
     raw = re.sub(r"^```(?:json)?\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
-    raw = raw.strip()
-    # If there's text before the first {, strip it
     brace = raw.find("{")
     if brace > 0:
         raw = raw[brace:]
-    # If there's text after the last }, strip it
     end_brace = raw.rfind("}")
     if end_brace != -1 and end_brace < len(raw) - 1:
         raw = raw[:end_brace + 1]
     return raw.strip()
+
+
+def _get_full_policy_text(store: "PolicyVectorStore", source_filter: list[str] | None) -> str:
+    """
+    Reassemble full policy text from ChromaDB chunks sorted by page.
+    Chunks into segments of ~6000 chars each to handle any PDF size safely.
+    Returns list of text segments.
+    """
+    try:
+        col = store._client.get_collection(store.collection_name)
+        where = None
+        if source_filter and len(source_filter) == 1:
+            where = {"source": {"$eq": source_filter[0]}}
+        elif source_filter and len(source_filter) > 1:
+            where = {"source": {"$in": source_filter}}
+
+        result = col.get(where=where, include=["documents", "metadatas"]) if where else col.get(include=["documents", "metadatas"])
+        pairs = sorted(zip(result["documents"], result["metadatas"]), key=lambda x: x[1].get("page", 0))
+
+        seen, unique_texts = set(), []
+        for text, meta in pairs:
+            if text not in seen:
+                seen.add(text)
+                unique_texts.append(f"[Page {meta.get('page', '?')}]\n{text}")
+
+        return "\n\n".join(unique_texts)
+    except Exception as e:
+        print(f"[chain] Error getting full policy text: {e}")
+        return ""
+
+
+
 
 # ---------------------------------------------------------------------------
 # Main Chain
@@ -436,99 +520,102 @@ class PolicyChain:
 
         return {"answer": answer, "sources": sources}
 
-    def _llm_extract_json(self, fields: list, field_hints: dict, context: str) -> dict:
-        """Call LLM to extract a set of fields from context, return dict."""
-        hints_str = "\n".join(f"  - {k}: {v}" for k, v in field_hints.items())
-        system_msg = SystemMessage(content=(
-            "You are a JSON extractor for insurance policies. "
-            "Respond with ONLY a valid JSON object. No explanation, no markdown, no code fences."
-        ))
-        user_msg = HumanMessage(content=(
-            f"Extract these fields from the insurance policy text.\n"
-            f"Field definitions:\n{hints_str}\n\n"
-            f"Rules:\n"
-            f"- Return ONLY a JSON object with keys: {json.dumps(fields)}\n"
-            f"- Use null for fields not found in the text\n"
-            f"- Do not infer or guess values not explicitly stated\n\n"
-            f"Policy text:\n{context}\n\nJSON:"
-        ))
-        raw = self._parser.invoke(self._llm.invoke([system_msg, user_msg]))
+    def _llm_json(self, system: str, user: str) -> dict:
+        raw = self._parser.invoke(
+            self._llm.invoke([
+                SystemMessage(content=system),
+                HumanMessage(content=user)
+            ])
+        )
+
         raw = _strip_fences(raw)
-        try:
-            result = json.loads(raw)
-            if isinstance(result, dict):
-                return result
-        except json.JSONDecodeError as e:
-            print(f"[chain] JSON parse error: {e} | raw: {raw[:300]}")
-        return {f: None for f in fields}
 
-    def extract_attributes(self, source_filter: list[str] | None = None) -> dict:
-        merged = {}
-        sf = source_filter or self._source_filter
+        # Extract only first JSON object
+        match = re.search(r"\{.*?\}", raw, re.DOTALL)
 
-        # Step 1: Extract predefined fields
-        for fields, query, field_hints in _EXTRACT_GROUPS:
-            results = self._store.retrieve(query=query, k=4, source_filter=sf)
-            if not results:
-                for f in fields:
-                    merged[f] = None
-                continue
-
-            context_parts = []
-            for r in results:
-                text = r["text"][:600]
-                context_parts.append(f"[Page {r['page']}]\n{text}")
-            context = "\n---\n".join(context_parts)
-
-            group_data = self._llm_extract_json(fields, field_hints, context)
-            merged.update(group_data)
-
-        # Step 2: Discover policy-specific dynamic attributes
-        dynamic = self._discover_dynamic_attributes(sf)
-        if dynamic:
-            merged["_dynamic"] = dynamic
-
-        return merged
-
-    def _discover_dynamic_attributes(self, source_filter: list[str] | None) -> dict:
-        """Ask the LLM to identify any unique/notable attributes specific to this policy."""
-        queries = [
-            "unique benefits special features multiplier bonus health checkup",
-            "deductible sub-limit specific coverage restore benefit",
-            "free look period moratorium portability migration",
-        ]
-        context_parts = []
-        for q in queries:
-            results = self._store.retrieve(query=q, k=2, source_filter=source_filter)
-            for r in results:
-                context_parts.append(f"[Page {r['page']}]\n{r['text'][:400]}")
-
-        if not context_parts:
+        if not match:
+            print("[chain] No JSON found")
             return {}
 
-        context = "\n---\n".join(context_parts[:6])
-        system_msg = SystemMessage(content=(
-            "You are an insurance policy analyst. "
-            "Respond with ONLY a valid JSON object. No explanation, no markdown."
-        ))
-        user_msg = HumanMessage(content=(
-            "Read this insurance policy text and identify any notable attributes "
-            "that are SPECIFIC or UNIQUE to this policy — things not commonly found in all policies, "
-            "such as special riders, unique benefits, restore features, multiplier benefits, "
-            "free look period, moratorium period, or any other standout features.\n\n"
-            "Return a JSON object where keys are short attribute names (snake_case) "
-            "and values are brief descriptions. Return empty object {} if nothing notable found.\n\n"
-            f"Policy text:\n{context}\n\nJSON:"
-        ))
-        raw = self._parser.invoke(self._llm.invoke([system_msg, user_msg]))
-        raw = _strip_fences(raw)
+        json_text = match.group(0)
+
         try:
-            result = json.loads(raw)
+            result = json.loads(json_text)
+
             if isinstance(result, dict):
                 return result
-        except json.JSONDecodeError as e:
-            print(f"[chain] Dynamic attributes parse error: {e} | raw: {raw[:200]}")
+
+        except Exception as e:
+            print(f"[chain] JSON parse error: {e}")
+
         return {}
+
+    def extract_attributes(self, source_filter: list[str] | None = None) -> dict:
+        """
+        Extract partner-relevant attributes using targeted RAG retrieval.
+        Each group uses a specific query to retrieve only the most relevant chunks.
+        Fast: 1 LLM call per group (~7 total). Completely separate from chatbox pipeline.
+        """
+        sf = source_filter or self._source_filter
+        merged: dict = {}
+
+        system = (
+            "You are an insurance policy data extractor. "
+            "Respond with ONLY a valid JSON object. "
+            "No explanation, no preamble, no markdown, no code fences. Just the JSON."
+        )
+
+        for field_defs, query, hint in _PARTNER_ATTR_GROUPS:
+            field_list = list(field_defs.keys())
+            field_defs_str = "\n".join(f"  {k}: {v}" for k, v in field_defs.items())
+
+            # Retrieve top 5 most relevant chunks for this group's query
+            results = self._store.retrieve(query=query, k=10, source_filter=sf)
+
+            print("\n" + "=" * 80)
+            print("QUERY:", query)
+            print("RESULTS FOUND:", len(results))
+
+            for r in results:
+                print(f"PAGE {r['page']}")
+                print(r['text'][:500])
+                print("-" * 40)
+
+            if not results:
+                merged.update({k: None for k in field_list})
+                continue
+
+            # Build compact context — just the chunk text, no parent_text bloat
+            context = "\n---\n".join(
+                f"[Page {r['page']}] {r['text'][:800]}" for r in results
+            )
+
+            user = (
+                f"Extract these fields from the insurance policy excerpts below.\n\n"
+                f"Fields to extract:\n{field_defs_str}\n\n"
+                f"Hint: {hint}\n\n"
+                f"Return ONLY a JSON object with exactly these keys: {json.dumps(field_list)}\n"
+                f"Use null for fields not found. No extra text.\n\n"
+                f"Policy excerpts:\n{context}\n\nJSON:"
+            )
+
+            result = self._llm_json(system, user)
+            merged.update({k: result.get(k, None) for k in field_list})
+            print(f"[chain] Extracted group: {field_list[0]}... → {list(result.keys())}")
+
+        # Dynamic attributes — one extra call on most relevant chunks
+        # dyn_results = self._store.retrieve(
+        #     query="restore benefit recharge benefit cumulative bonus multiplier benefit OPD cover hospital cash health checkup wellness benefit",
+        #     k=8,
+        #     source_filter=sf
+        # )   
+        # if dyn_results:
+        #     dyn_context = "\n---\n".join(f"[Page {r['page']}] {r['text'][:800]}" for r in dyn_results)
+        #     dynamic = self._llm_json(system, _DYNAMIC_ATTR_PROMPT.format(text=dyn_context))
+        #     if dynamic:
+        #         merged["_dynamic"] = dynamic
+
+        # return merged
 
     def reset_memory(self) -> None:
         self._history.clear()
