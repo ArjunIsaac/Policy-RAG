@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import sys
+import time  # identifying potential bottlenecks in retrieval
 from typing import Any, List, Dict
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -21,30 +22,57 @@ from langchain_ollama import ChatOllama
 from langchain_community.document_transformers import LongContextReorder
 from sentence_transformers import CrossEncoder
 
+import nltk  # language processing
+from nltk.corpus import stopwords
+
 from vector_store import PolicyVectorStore
+
+try:
+    nltk.data.find('corpora/stopwords')
+except LookupError:
+    nltk.download('stopwords')
+
+STOPWORDS = set(stopwords.words('english'))
+CUSTOM_STOPWORDS = {
+    'please', 'tell', 'me', 'know', 'want', 'ask', 'like', 'help',
+    'thank', 'thanks', 'hi', 'hello', 'hey', 'maybe', 'perhaps', 'basically', 'actually',
+    'really', 'quite', 'just', 'also', 'well', 'look', 'see', 'think', 'guess', 'feel',
+}
+STOPWORDS.update(CUSTOM_STOPWORDS)
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-HYBRID_FETCH_K = 150
-FINAL_K = 12
+HYBRID_FETCH_K = 100
+FINAL_K = 8
 REORDER_ENABLED = True
 
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are an expert insurance policy analyst reviewing regulatory policy contracts.
+SYSTEM_PROMPT = """You are an expert insurance policy analyst reviewing regulatory policy contracts. 
 
-STRICT INSTRUCTIONAL RULES:
-1. Answer the question directly using ONLY the RETRIEVED CONTEXT below. Do not assume, infer, or extrapolate.
+Your task is to analyze the retrieved context and provide a highly accurate determination of coverage, waiting periods, and exclusions.
+
+CRITICAL LOGIC RULE (TERMINOLOGY MAPPING):
+Users often ask questions using common language (e.g., "skin cancer", "eye surgery", "LASIK"). Insurance policies use formal legal or medical definitions (e.g., "skin carcinoma", "malignant melanoma", "cataract", "refractive error"). 
+Before concluding that a condition is unmentioned, you MUST check if the common term maps to a formal definition or sub-exclusion within the context.
+
+EXECUTION PROTOCOL:
+You must process your response using two distinct steps. 
+1. Inside an internal `<policy_analysis>` section, explicitly evaluate terminology synonyms and cross-reference the text for any exclusions or conditional clauses related to those mapped terms.
+2. Provide your clean, comprehensive final response to the user inside a `<final_response>` section. Do not include the XML block syntax inside your text; output them as clean, structural tags.
+
+STRICT INSTRUCTIONAL RULES FOR FINAL RESPONSE:
+1. Answer the question directly using ONLY the RETRIEVED CONTEXT below. Do not assume or extrapolate beyond the provided text.
 2. INTERPRET TABLES ACCURATELY: Insurance policies utilize benefit grids. If a policy benefit, surgery type, or clause is associated with the term "NIL", "No Coverage", "0", or "-" inside a table row or text block, this means coverage for that item is completely ZERO / NOT COVERED. You must state this explicitly.
 3. If a condition or coverage is subject to a conditional exclusion (e.g., "Excluded unless X happens" or "Covered only if Y is met"), you MUST state that exact condition clearly instead of stating that the policy is unclear or does not mention it.
 4. Quote exact policy text or table entries when stating inclusions, exclusions, or conditional requirements.
 5. If a condition is definitively and permanently excluded without exception, state: "The policy explicitly excludes...".
-6. If a condition is completely unmentioned anywhere in the text, state: "The policy does not mention this condition."
+6. If a condition is completely unmentioned anywhere in the text (even after checking for medical/legal synonyms), state: "The policy does not mention this condition."
 7. Every assertion must be cited exactly in the format: (Page X, Clause: Y) or (Page X, Table: Y) as provided in the context metadata.
 
 RETRIEVED CONTEXT:
@@ -61,7 +89,6 @@ _PROMPT = ChatPromptTemplate.from_messages([
 # Attribute extraction — partner-focused, full-document approach
 # ---------------------------------------------------------------------------
 
-# Each group: (field_definitions_dict, section_hint_for_llm)
 # Each group: (field_definitions, rag_query, hint)
 _PARTNER_ATTR_GROUPS = [
     (
@@ -75,16 +102,16 @@ _PARTNER_ATTR_GROUPS = [
             "grace_period_days": "number - grace period for renewal in days e.g. 30",
         },
         "Total Health Plan HDFC ERGO sum insured 5 lakhs tenure 1 year free look period 15 days grace period 30 days lifetime renewable",
-        "Look in: product name heading, sum insured table (e.g. 5 Lakhs), tenure (1 Year), renewal clause (lifetime renewable), free look period (15 days from receipt), grace period (30 days after premium due date)."
+        "Look in: product name heading, sum insured table (e.g. 5 Lakhs), tenure (1 Year), renewal clause (lifetime renewable), free look period (15 days from receipt), grace period (30 days after premium due date).",
     ),
     (
         {
-    "waiting_period_initial_days": "number - initial waiting period in days e.g. 30",
-    "waiting_period_ped_months": "number - pre-existing disease PED waiting period in months e.g. 48",
-    "waiting_period_specific_illness_months": "number - specific illness/procedure waiting period in months e.g. 24",
-},
-"30 day waiting period pre-existing disease PED 48 months continuous coverage specific disease procedure 24 months cataract hernia arthritis",
-"Look in: Section C Waiting Period & Exclusions. Initial waiting period = 30 days. PED (pre-existing disease) = 48 months. Specific disease/procedure waiting = 24 months."
+            "waiting_period_initial_days": "number - initial waiting period in days e.g. 30",
+            "waiting_period_ped_months": "number - pre-existing disease PED waiting period in months e.g. 48",
+            "waiting_period_specific_illness_months": "number - specific illness/procedure waiting period in months e.g. 24",
+        },
+        "30 day waiting period pre-existing disease PED 48 months continuous coverage specific disease procedure 24 months cataract hernia arthritis",
+        "Look in: Section C Waiting Period & Exclusions. Initial waiting period = 30 days. PED (pre-existing disease) = 48 months. Specific disease/procedure waiting = 24 months.",
     ),
     (
         {
@@ -95,7 +122,7 @@ _PARTNER_ATTR_GROUPS = [
             "icu_sublimit": "string or null - ICU charges cap e.g. '2% of sum insured'",
         },
         "copayment co-pay cost sharing room rent sub-limit ICU intensive care unit sub-limit bed charges",
-        "Look in: definition of Copayment, any co-pay clause. If no co-pay % is stated, copay_applicable=false and copay_percentage=null. Room rent and ICU sub-limits: look for daily cap amounts or percentage of sum insured."
+        "Look in: definition of Copayment, any co-pay clause. If no co-pay % is stated, copay_applicable=false and copay_percentage=null. Room rent and ICU sub-limits: look for daily cap amounts or percentage of sum insured.",
     ),
     (
         {
@@ -109,7 +136,7 @@ _PARTNER_ATTR_GROUPS = [
             "post_hospitalisation_days": "number - post-hospitalisation cover in days e.g. 60",
         },
         "inpatient day care domiciliary maternity ambulance organ donor pre-hospitalisation 30 days post-hospitalisation 60 days",
-        "Look in: Section B Benefits - inpatient, day care, domiciliary, maternity, ambulance, organ donor, pre/post hospitalisation days."
+        "Look in: Section B Benefits - inpatient, day care, domiciliary, maternity, ambulance, organ donor, pre/post hospitalisation days.",
     ),
     (
         {
@@ -120,14 +147,14 @@ _PARTNER_ATTR_GROUPS = [
             "ncb_benefit": "string or null - No Claim Bonus or Cumulative Bonus description",
         },
         "cashless facility network provider claim settlement 30 days portability port insurer No Claim Bonus cumulative bonus NCB",
-        "Look in: cashless service clause (available at network hospitals), claim settlement (company must settle within 30 days), portability clause (port to other insurers 45 days before renewal), Cumulative Bonus / No Claim Bonus definition."
+        "Look in: cashless service clause (available at network hospitals), claim settlement (company must settle within 30 days), portability clause (port to other insurers 45 days before renewal), Cumulative Bonus / No Claim Bonus definition.",
     ),
     (
         {
             "permanent_exclusions": "array of strings - key permanently excluded conditions (max 10)",
         },
         "permanent exclusions not covered excluded war cosmetic obesity adventure sports alcohol infertility",
-        "Look in: Section C Standard and Specific General Exclusions. List main permanent exclusions."
+        "Look in: Section C Standard and Specific General Exclusions. List main permanent exclusions.",
     ),
 ]
 
@@ -215,8 +242,6 @@ def _get_full_policy_text(store: "PolicyVectorStore", source_filter: list[str] |
         return ""
 
 
-
-
 # ---------------------------------------------------------------------------
 # Main Chain
 # ---------------------------------------------------------------------------
@@ -247,27 +272,34 @@ class PolicyChain:
 
     def _get_cross_encoder(self) -> CrossEncoder:
         if self._cross_encoder is None:
-            print("[chain] Loading CrossEncoder…")
+            print("[chain] Loading CrossEncoder on GPU…")
             sys.stdout.flush()
-            self._cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL)
+            self._cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL, device="cuda")
         return self._cross_encoder
 
     # ------------------------------------------------------------------
     # Query expansion
     # ------------------------------------------------------------------
 
+    def _remove_stopwords(self, text: str) -> str:
+        words = text.lower().split()
+        filtered = [w for w in words if w not in STOPWORDS and len(w) > 2]
+        return ' '.join(filtered)
+
     def _transform_query(self, query: str) -> str:
         q_lower = query.lower()
+
         if any(term in q_lower for term in ["cancer", "carcinoma", "melanoma", "tumor"]):
-            query += " critical illness definition"
+            query += " critical illness definition carcinoma melanoma tumor malignancy"
         if any(term in q_lower for term in ["excluded", "exclusion", "not covered"]):
-            query += " permanent exclusion"
+            query += " permanent exclusion standard exclusions limits"
         if any(term in q_lower for term in ["waiting", "period"]):
-            query += " waiting period pre-existing"
+            query += " waiting period pre-existing specific illness cataract"
         if any(term in q_lower for term in ["copay", "co-pay"]):
             query += " co-payment"
-        if any(term in q_lower for term in ["eye", "cataract", "lasik", "surgery", "surgeries"]):
-            query += " limit sublimit cap NIL table benefit"
+        if any(term in q_lower for term in ["eye", "cataract", "lasik", "surgery", "surgeries", "vision", "eyesight"]):
+            query += " limit sublimit cap NIL table benefit cataract refractive error dioptres eyesight correction"
+
         return query
 
     # ------------------------------------------------------------------
@@ -276,8 +308,8 @@ class PolicyChain:
 
     def _extract_condition(self, query: str) -> str | None:
         normalized = query.replace('–', '-').replace('—', '-').lower()
-        keywords = ["cancer", "carcinoma", "melanoma", "tumor", "eye"]
-        
+        keywords = ["cancer", "carcinoma", "melanoma", "tumor", "eye", "cataract", "lasik", "refractive"]
+
         for kw in keywords:
             if kw in normalized:
                 match = re.search(r'([a-z0-9\-\s]+?\b' + kw + r'\b)', normalized)
@@ -291,7 +323,7 @@ class PolicyChain:
 
     def _fetch_forced_chunks(self, condition: str | None = None) -> List[Document]:
         """
-        Fetch chunks programmatically to bypass un-indexed string matching limitations 
+        Fetch chunks programmatically to bypass un-indexed string matching limitations
         and surface exact phrase overlaps.
         """
         try:
@@ -302,12 +334,12 @@ class PolicyChain:
                     where = {"source": self._source_filter[0]}
                 else:
                     where = {"source": {"$in": self._source_filter}}
-            
+
             if where:
                 result = col.get(where=where, include=["metadatas", "documents"])
             else:
                 result = col.get(include=["metadatas", "documents"])
-                
+
             docs = []
             search_terms = []
             if condition:
@@ -317,18 +349,24 @@ class PolicyChain:
                 heading = (meta.get("heading") or "").lower()
                 text_lower = text.lower()
                 match = False
-                
+
                 if search_terms and all(term in text_lower for term in search_terms):
                     match = True
                 elif condition and condition in text_lower:
                     match = True
-                
+
                 if "critical illness" in heading or "critical illness" in text_lower:
                     match = True
-                
-                if any(k in heading or k in text_lower for k in ["cancer", "carcinoma", "melanoma", "eye surgery"]):
+
+                if "exclusion" in heading or "exclusion" in text_lower:
                     match = True
-                    
+
+                if "waiting period" in heading or "waiting period" in text_lower:
+                    match = True
+
+                if any(k in heading or k in text_lower for k in ["cancer", "carcinoma", "melanoma", "eye surgery", "cataract", "lasik", "refractive", "dioptres"]):
+                    match = True
+
                 if match:
                     parent = meta.get("parent_text", text)
                     doc = Document(
@@ -342,7 +380,7 @@ class PolicyChain:
                         }
                     )
                     docs.append(doc)
-            
+
             seen = set()
             unique = []
             for doc in docs:
@@ -350,7 +388,7 @@ class PolicyChain:
                 if key not in seen:
                     seen.add(key)
                     unique.append(doc)
-            return unique[:5]
+            return unique[:8]  # Increased forced pool slightly to avoid missing specific sections
         except Exception as e:
             print(f"[chain] Error fetching forced chunks: {e}")
             return []
@@ -361,7 +399,7 @@ class PolicyChain:
 
     def _retrieve_docs(self, query: str, debug: bool = False) -> List[Document]:
         q_lower = query.lower()
-        is_targeted_query = any(term in q_lower for term in ["cancer", "carcinoma", "melanoma", "tumor", "eye", "surgery"])
+        is_targeted_query = any(term in q_lower for term in ["cancer", "carcinoma", "melanoma", "tumor", "eye", "surgery", "cataract", "lasik", "refractive"])
 
         # 1. Regular hybrid search
         use_mmr = not is_targeted_query
@@ -484,21 +522,61 @@ class PolicyChain:
         keep = self._window * 2
         return self._history[-keep:] if len(self._history) > keep else self._history[:]
 
+    def _clean_output(self, raw_output: str) -> str:
+        """
+        Extracts only the content within <final_response> tags if present.
+        Falls back to returning everything if structural tags are omitted or broken.
+        """
+        match = re.search(r"<final_response>(.*?)</final_response>", raw_output, re.DOTALL | re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+
+        # Fallback processing: strip out policy_analysis tags cleanly if the model mixed up layout
+        clean = re.sub(r"<policy_analysis>.*?</policy_analysis>", "", raw_output, flags=re.DOTALL | re.IGNORECASE)
+        clean = re.sub(r"</?final_response>", "", clean, flags=re.DOTALL | re.IGNORECASE)
+        return clean.strip()
+
     # ------------------------------------------------------------------
     # Public methods
     # ------------------------------------------------------------------
 
     def ask(self, question: str) -> dict:
+        start_time = time.time()
+        t0 = time.time()
+
         expanded = self._transform_query(question)
+        t1 = time.time()
+        print(f'[chain] Query transformed : {t1-t0:.2f}s')
+        sys.stdout.flush()
+
         docs = self._retrieve_docs(expanded, debug=False)
+        t2 = time.time()
+        print(f'[chain] Docs retrieved : {t2-t1:.2f}s')
+        sys.stdout.flush()
+
         context = self._format_docs(docs)
+        t3 = time.time()
+        print(f'[chain] Context formatted : {t3-t2:.2f}s')
+        sys.stdout.flush()
 
         messages = _PROMPT.format_messages(
             context=context,
             chat_history=self._trimmed_history(),
             question=question,
         )
-        answer = self._parser.invoke(self._llm.invoke(messages))
+
+        t4 = time.time()
+        print(f'[chain] Build messages:{t4-t3:.2f}s')
+        sys.stdout.flush()
+
+        raw_answer = self._parser.invoke(self._llm.invoke(messages))
+        answer = self._clean_output(raw_answer)
+
+        t5 = time.time()
+        print(f'[chain] LLM generation: {t5-t4:.2f}s')
+        sys.stdout.flush()
+        print(f'[chain] Total time: {t5-start_time:.2f}s')
+        sys.stdout.flush()
 
         self._history.append(HumanMessage(content=question))
         self._history.append(AIMessage(content=answer))
@@ -519,6 +597,70 @@ class PolicyChain:
                 })
 
         return {"answer": answer, "sources": sources}
+
+    def ask_stream(self, question: str):
+        expanded = self._transform_query(question)
+        docs = self._retrieve_docs(expanded, debug=False)
+        context = self._format_docs(docs)
+
+        messages = _PROMPT.format_messages(
+            context=context,
+            chat_history=self._trimmed_history(),
+            question=question,
+        )
+
+        full_raw_answer = ""
+        in_final_response = False
+        buffer = ""
+
+        for chunk in self._llm.stream(messages):
+            content = chunk.content
+            full_raw_answer += content
+
+            if not in_final_response:
+                buffer += content
+                if "<final_response>" in buffer:
+                    in_final_response = True
+                    # Yield anything that arrived after the opening structural tag
+                    parts = buffer.split("<final_response>")
+                    if len(parts) > 1 and parts[1]:
+                        clean_content = parts[1].replace("</final_response>", "")
+                        if clean_content:
+                            yield {"type": "text", "content": clean_content}
+                    buffer = ""
+            else:
+                if "</final_response>" in content:
+                    clean_content = content.split("</final_response>")[0]
+                    if clean_content:
+                        yield {"type": "text", "content": clean_content}
+                else:
+                    yield {"type": "text", "content": content}
+
+        # Fallback if structural tags were completely skipped by the model
+        if not in_final_response and full_raw_answer:
+            yield {"type": "text", "content": self._clean_output(full_raw_answer)}
+
+        answer = self._clean_output(full_raw_answer)
+
+        sources = []
+        seen = set()
+        for doc in docs:
+            m = doc.metadata
+            key = f"{m.get('source')}::{m.get('page')}::{m.get('heading')}"
+            if key not in seen:
+                seen.add(key)
+                sources.append({
+                    "source": m.get("source", ""),
+                    "page": m.get("page", "?"),
+                    "line": m.get("line", "?"),
+                    "clause": m.get("heading", "") or m.get("clause", ""),
+                    "snippet": doc.page_content[:180].replace("\n", " "),
+                })
+
+        self._history.append(HumanMessage(content=question))
+        self._history.append(AIMessage(content=answer))
+
+        yield {"type": "sources", "sources": sources}
 
     def _llm_json(self, system: str, user: str) -> dict:
         raw = self._parser.invoke(
@@ -554,7 +696,7 @@ class PolicyChain:
         """
         Extract partner-relevant attributes using targeted RAG retrieval.
         Each group uses a specific query to retrieve only the most relevant chunks.
-        Fast: 1 LLM call per group (~7 total). Completely separate from chatbox pipeline.
+        Fast: 1 LLM call per group (~6 total). Completely separate from chatbox pipeline.
         """
         sf = source_filter or self._source_filter
         merged: dict = {}
@@ -569,7 +711,7 @@ class PolicyChain:
             field_list = list(field_defs.keys())
             field_defs_str = "\n".join(f"  {k}: {v}" for k, v in field_defs.items())
 
-            # Retrieve top 5 most relevant chunks for this group's query
+            # Retrieve top relevant chunks for this group's query
             results = self._store.retrieve(query=query, k=10, source_filter=sf)
 
             print("\n" + "=" * 80)
@@ -608,14 +750,14 @@ class PolicyChain:
         #     query="restore benefit recharge benefit cumulative bonus multiplier benefit OPD cover hospital cash health checkup wellness benefit",
         #     k=8,
         #     source_filter=sf
-        # )   
+        # )
         # if dyn_results:
         #     dyn_context = "\n---\n".join(f"[Page {r['page']}] {r['text'][:800]}" for r in dyn_results)
         #     dynamic = self._llm_json(system, _DYNAMIC_ATTR_PROMPT.format(text=dyn_context))
         #     if dynamic:
         #         merged["_dynamic"] = dynamic
 
-        # return merged
+        return merged
 
     def reset_memory(self) -> None:
         self._history.clear()
