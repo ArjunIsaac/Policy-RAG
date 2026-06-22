@@ -22,6 +22,7 @@ dependencies = [
     "rank-bm25>=0.2.2",
     "pymupdf4llm>=1.27.2.3",
     "langchain-text-splitters>=1.1.2",
+    "nltk>=3.9.4",
 ]
 
 [build-system]
