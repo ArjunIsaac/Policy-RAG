@@ -39,7 +39,7 @@ class PolicyChain:
     def __init__(
         self,
         vector_store: PolicyVectorStore,
-        model: str = "mistral",
+        model: str = "qwen3:8b",
         temperature: float = 0.0,
         k_docs: int = FINAL_K,
         memory_window: int = 4,
