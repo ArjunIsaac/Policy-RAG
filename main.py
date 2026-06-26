@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 import streamlit as st
 
@@ -26,7 +27,10 @@ from policy_chain import PolicyChain
 # Constants
 # ---------------------------------------------------------------------------
 
-DATA_DIR = Path("data/raw")
+# NOTE: PDFs now live under ./static/raw so Streamlit's static file server
+# (enabled in .streamlit/config.toml) can serve them directly — this is what
+# lets the page-number citations link straight to the right page of the PDF.
+DATA_DIR = Path("static/raw")
 CHROMA_DIR = Path("data/chroma_db")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 CHROMA_DIR.mkdir(parents=True, exist_ok=True)
@@ -69,7 +73,6 @@ ATTR_LABELS: dict[str, str] = {
     "cashless_available": "Cashless Facility",
     "network_hospitals": "Network Hospitals",
     "claim_settlement_days": "Claim Settlement (days)",
-    "claim_settlement_note": "Claim Settlement Note",
     "portability_available": "Portability",
     "ncb_benefit": "No Claim Bonus",
     "permanent_exclusions": "Permanent Exclusions",
@@ -105,18 +108,62 @@ st.markdown("""
     display:inline-block; background:#21262d; border:1px solid #30363d;
     color:#58a6ff; border-radius:6px; padding:2px 9px;
     font-size:.76rem; margin:3px 3px 0 0; font-family:monospace;
+    text-decoration:none; cursor:pointer; transition:background .15s ease;
   }
+  .cite-badge:hover { background:#30363d; border-color:#58a6ff; }
   .attr-card {
     background:#161b22; border:1px solid #30363d; border-radius:10px;
     padding:14px 18px; margin-bottom:10px;
   }
   .attr-label { color:#8b949e; font-size:.78rem; text-transform:uppercase; letter-spacing:.06em; }
   .attr-value { color:#e6edf3; font-size:1rem; font-weight:500; margin-top:2px; }
+  .attr-meta { margin-top:6px; display:flex; flex-wrap:wrap; gap:4px; align-items:center; }
+  .attr-page {
+    display:inline-block; background:#0d419d22; border:1px solid #1f6feb;
+    color:#58a6ff; border-radius:4px; padding:1px 7px;
+    font-size:.72rem; font-family:monospace; cursor:pointer;
+    text-decoration:none; transition:background .15s ease;
+  }
+  .attr-page:hover { background:#1f6feb44; }
+  .attr-clause {
+    display:inline-block; background:#21262d; border:1px solid #30363d;
+    color:#8b949e; border-radius:4px; padding:1px 7px;
+    font-size:.72rem; font-family:monospace;
+  }
+  .conf-high    { color:#3fb950; font-size:.7rem; }
+  .conf-medium  { color:#d29922; font-size:.7rem; }
+  .conf-low     { color:#f0883e; font-size:.7rem; }
+  .conf-not_found { color:#6e7681; font-size:.7rem; }
+  .status-requires { color:#f0883e; font-size:.7rem; font-style:italic; }
+  .attr-value-warn { color:#d29922; font-size:.95rem; font-weight:500; margin-top:2px; }
+  .attr-value-null { color:#484f58; font-size:.95rem; font-style:italic; margin-top:2px; }
   .section-header {
     color:#58a6ff; font-size:.85rem; font-weight:700;
     text-transform:uppercase; letter-spacing:.1em; margin:18px 0 8px;
   }
   div[data-testid="stTabs"] button { font-size:.9rem; }
+
+  .summary-card {
+    background: linear-gradient(135deg, #0d2137 0%, #161b22 100%);
+    border: 1px solid #1f6feb; border-radius: 12px;
+    padding: 20px 24px; margin-bottom: 20px;
+  }
+  .summary-title {
+    color:#58a6ff; font-size:.8rem; font-weight:700;
+    text-transform:uppercase; letter-spacing:.12em; margin-bottom:14px;
+  }
+  .summary-tier { font-size:1.4rem; font-weight:700; color:#e6edf3; margin-bottom:2px; }
+  .summary-conf { color:#3fb950; font-size:.85rem; margin-bottom:14px; }
+  .summary-grid { display:grid; grid-template-columns: repeat(3, 1fr); gap:10px; }
+  .summary-item-label { color:#6e7681; font-size:.72rem; text-transform:uppercase; letter-spacing:.06em; }
+  .summary-item-value { color:#e6edf3; font-size:.9rem; font-weight:500; margin-top:1px; }
+  .conflict-banner { background:#2d1f00; border:1px solid #f0883e; border-radius:8px; padding:10px 14px; margin-top:8px; }
+  .conflict-title { color:#f0883e; font-size:.78rem; font-weight:700; margin-bottom:6px; }
+  .conflict-val { color:#ffa657; font-size:.88rem; font-weight:600; min-width:80px; display:inline-block; }
+  .conflict-clause { color:#8b949e; font-size:.78rem; }
+  .evidence-box { background:#0d1117; border:1px solid #21262d; border-radius:6px;
+    padding:8px 12px; margin-top:6px; font-size:.78rem;
+    color:#8b949e; font-family:monospace; line-height:1.5; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -151,7 +198,7 @@ def get_store() -> PolicyVectorStore:
 def get_chain(sources: list[str] | None) -> PolicyChain:
     return PolicyChain(
         vector_store=get_store(),
-        model="mistral",
+        model="qwen3:8b",
         temperature=0.05,
         k_docs=6,
         source_filter=sources if sources else None,
@@ -161,40 +208,209 @@ def get_chain(sources: list[str] | None) -> PolicyChain:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _render_value(v, key: str = "") -> str:
+def _render_value(v) -> str:
+    """Render a value for comparison table — handles citation envelopes and raw values."""
+    if isinstance(v, dict) and "value" in v:
+        # Citation envelope — use the display string
+        return v.get("display") or "Not specified in policy"
     if isinstance(v, list):
-        return ", ".join(str(x) for x in v) if v else "Not extracted"
+        return ", ".join(str(x) for x in v)
     if isinstance(v, bool):
         return "Yes" if v else "No"
     if v is None:
-        # Context-aware null messages
-        not_applicable = {"copay_percentage", "copay_conditions", "room_rent_sublimit", "icu_sublimit"}
-        refer_insurer  = {"network_hospitals"}
-        manual_review  = {"permanent_exclusions"}
-        not_specified  = {"ncb_benefit"}
-        if key in not_applicable:
-            # Only show Not Applicable if co-pay is confirmed false
-            return "Not Applicable"
-        if key in refer_insurer:
-            return "Refer insurer network hospital list"
-        if key in manual_review:
-            return "Requires manual verification"
-        if key in not_specified:
-            return "Not specified in policy"
         return "Not specified in policy"
     return str(v)
 
 
-def _attr_card(label: str, value, key: str = "") -> None:
-    val_str = _render_value(value, key)
-    # Style null-equivalent values differently
-    null_values = {"Not specified in policy", "Requires manual verification",
-                   "Refer insurer network hospital list", "Not Applicable", "Not extracted"}
-    value_color = "#8b949e" if val_str in null_values else "#e6edf3"
+def _pdf_url(source: str, page: int | None = None) -> str:
+    """Build the static-served URL for a source PDF, optionally deep-linking to a page.
+
+    Requires the PDF to live under ./static/raw (see DATA_DIR) and
+    enableStaticServing = true in .streamlit/config.toml.
+    """
+    url = f"app/static/raw/{quote(source)}"
+    if page:
+        url += f"#page={page}"
+    return url
+
+
+def _page_badge_html(source: str | None, page: int | None, css_class: str = "attr-page") -> str:
+    """Render a page-number badge. Clickable (opens the PDF at that page) when a
+    source filename is known, otherwise a plain non-interactive badge."""
+    if not page:
+        return ""
+    if source:
+        return (
+            f'<a class="{css_class}" href="{_pdf_url(source, page)}" '
+            f'target="_blank" rel="noopener" title="Open PDF at page {page}">📄 p.{page}</a>'
+        )
+    return f'<span class="{css_class}">p.{page}</span>'
+
+
+def _attr_card(label: str, value, source: str = "") -> None:
+    if isinstance(value, dict) and "value" in value:
+        display   = value.get("display") or "Not specified in policy"
+        page      = value.get("page")
+        clause    = value.get("clause")
+        conf      = value.get("confidence", "high")
+        status    = value.get("status", "verified")
+        raw_val   = value.get("value")
+        evidence  = value.get("evidence")
+        conflicts = value.get("conflicts", [])
+
+        if raw_val is None:
+            val_class = "attr-value-null"
+        elif status == "requires_verification":
+            val_class = "attr-value-warn"
+        else:
+            val_class = "attr-value"
+
+        list_display = display
+        if isinstance(raw_val, list):
+            list_display = "<br>".join(f"• {item}" for item in raw_val)
+
+        conf_icons = {"high": "🟢", "medium": "🟡", "low": "🟠", "not_found": "⚪"}
+        conf_icon = conf_icons.get(conf, "⚪")
+
+        page_badge   = _page_badge_html(source, page)
+        clause_badge = f'<span class="attr-clause">{clause}</span>' if clause else ""
+        status_note  = (
+            f'<span class="status-requires">⚠ Requires verification</span>'
+            if status == "requires_verification" else ""
+        )
+        meta_html = ""
+        if page_badge or clause_badge or status_note:
+            meta_html = (
+                f'<div class="attr-meta">'
+                f'{page_badge}{clause_badge}'
+                f'<span class="conf-{conf}">{conf_icon} {conf}</span>'
+                f'{status_note}'
+                f'</div>'
+            )
+
+        st.markdown(
+            f'<div class="attr-card">'
+            f'<div class="attr-label">{label}</div>'
+            f'<div class="{val_class}">{list_display}</div>'
+            f'{meta_html}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        # Evidence for the value shown above (collapsed by default)
+        if evidence:
+            with st.expander("📄 Evidence", expanded=False):
+                st.markdown(
+                    f'<div class="evidence-box">"{evidence}"</div>',
+                    unsafe_allow_html=True,
+                )
+
+        # Conflict banner — print EVERY value found across the policy (the one shown
+        # above, plus every alternate), each with its own page, clause, and evidence,
+        # so nothing is silently buried or dropped.
+        if conflicts:
+            # Reuse whatever unit text the primary "display" string uses (e.g. "months",
+            # "days") so alternates are shown the same way, without hard-coding a unit.
+            unit_suffix = ""
+            if isinstance(raw_val, (int, float)) and display:
+                unit_suffix = display.replace(str(raw_val), "", 1).strip()
+
+            def _fmt_val(v) -> str:
+                return f"{v} {unit_suffix}".strip() if unit_suffix else str(v)
+
+            all_candidates = (
+                [{"value": raw_val, "page": page, "clause": clause,
+                  "evidence": evidence, "is_primary": True}]
+                + [dict(c, is_primary=False) for c in conflicts]
+            )
+
+            rows_html = ""
+            for c in all_candidates:
+                tag = (
+                    '<span style="color:#3fb950;font-size:.68rem;font-weight:700;">✓ SHOWN ABOVE</span>'
+                    if c.get("is_primary") else
+                    '<span style="color:#f0883e;font-size:.68rem;font-weight:700;">⚠ ALSO FOUND</span>'
+                )
+                c_page = _page_badge_html(source, c.get("page"))
+                c_evidence = c.get("evidence")
+                evidence_html = f'<div class="evidence-box">"{c_evidence}"</div>' if c_evidence else ""
+                rows_html += (
+                    '<div style="margin:0 0 10px;padding-bottom:8px;border-bottom:1px solid #30363d;">'
+                    f'<span class="conflict-val">{_fmt_val(c.get("value"))}</span> '
+                    f'<span class="conflict-clause">— {c.get("clause","")}</span> '
+                    f'{c_page} {tag}'
+                    f'{evidence_html}'
+                    '</div>'
+                )
+            st.markdown(
+                '<div class="conflict-banner">'
+                '<div class="conflict-title">⚠ Multiple values found across the policy — verify before relying on this field</div>'
+                f'{rows_html}'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+    else:
+        # Legacy / raw value
+        if isinstance(value, list):
+            display = "<br>".join(f"• {item}" for item in value)
+        elif isinstance(value, bool):
+            display = "Yes" if value else "No"
+        elif value is None:
+            display = "Not specified in policy"
+        else:
+            display = str(value)
+
+        val_class = "attr-value-null" if value is None else "attr-value"
+        st.markdown(
+            f'<div class="attr-card">'
+            f'<div class="attr-label">{label}</div>'
+            f'<div class="{val_class}">{display}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+
+def _summary_card(summary: dict) -> None:
+    """Render the top-level policy risk summary card."""
+    tier = summary.get("coverage_tier", "—")
+    conf = summary.get("overall_confidence", 0)
+    tier_color = {"Comprehensive": "#3fb950", "Standard": "#d29922", "Basic": "#f0883e"}.get(tier, "#8b949e")
+
+    conflicts = summary.get("conflicts", [])
+    conflict_html = ""
+    if conflicts:
+        names = ", ".join(c.replace("_", " ").title() for c in conflicts)
+        conflict_html = (
+            f'<div style="margin-top:10px;background:#2d1f00;border:1px solid #f0883e;'
+            f'border-radius:6px;padding:6px 10px;font-size:.76rem;color:#f0883e;">'
+            f'⚠ Conflicts detected in: {names} — verify before advising</div>'
+        )
+
+    items = [
+        ("PED Waiting Period",  summary.get("ped_waiting_period", "—")),
+        ("Co-pay",              summary.get("copay", "—")),
+        ("Room Rent",           summary.get("room_rent", "—")),
+        ("Portability",         summary.get("portability", "—")),
+        ("Renewability",        summary.get("renewability", "—")),
+        ("Maternity",           summary.get("maternity", "—")),
+    ]
+    grid_html = "".join(
+        f'<div class="summary-item">'
+        f'<div class="summary-item-label">{lbl}</div>'
+        f'<div class="summary-item-value">{v}</div>'
+        f'</div>'
+        for lbl, v in items
+    )
+
     st.markdown(
-        f'<div class="attr-card">'
-        f'<div class="attr-label">{label}</div>'
-        f'<div class="attr-value" style="color:{value_color}">{val_str}</div>'
+        f'<div class="summary-card">'
+        f'<div class="summary-title">Policy Risk Summary</div>'
+        f'<div class="summary-tier" style="color:{tier_color}">Coverage: {tier}</div>'
+        f'<div class="summary-conf">Overall Confidence: {conf}% '
+        f'({summary.get("fields_high",0)} high · {summary.get("fields_medium",0)} medium · '
+        f'{summary.get("fields_not_found",0)} not found / {summary.get("fields_total",0)} total)</div>'
+        f'<div class="summary-grid">{grid_html}</div>'
+        f'{conflict_html}'
         f'</div>',
         unsafe_allow_html=True,
     )
@@ -205,7 +421,15 @@ def _citation_badges(sources: list[dict]) -> str:
     for s in sources:
         clause = f", {s['clause']}" if s.get("clause") else ""
         label = f"📄 {s['source']}  p.{s['page']} ~l.{s['line']}{clause}"
-        html += f'<span class="cite-badge">{label}</span>'
+        page = s.get("page")
+        src_name = s.get("source", "")
+        if page and src_name:
+            html += (
+                f'<a class="cite-badge" href="{_pdf_url(src_name, page)}" '
+                f'target="_blank" rel="noopener" title="Open PDF at page {page}">{label}</a>'
+            )
+        else:
+            html += f'<span class="cite-badge">{label}</span>'
     return html
 
 
@@ -317,7 +541,7 @@ with st.sidebar:
         st.rerun()
 
     # ------------------------------------------------------------------
-    # DEBUG SECTION (new)
+    # DEBUG SECTION
     # ------------------------------------------------------------------
     st.divider()
     with st.expander("🔍 Debug Retrieval", expanded=False):
@@ -397,10 +621,10 @@ with tab_chat:
         if user_input:
             # Add user message to history
             st.session_state.messages.append({"role": "user", "content": user_input})
-            
+
             # Get chain
             chain = st.session_state.chain
-            
+
             if chain is None:
                 st.warning("Please select at least one policy from the sidebar first.")
                 st.session_state.messages.pop()  # Remove user message
@@ -410,7 +634,7 @@ with tab_chat:
                     response_placeholder = st.empty()
                     full_response = ""
                     sources = []
-                    
+
                     try:
                         # Stream the response
                         for chunk in chain.ask_stream(user_input):
@@ -420,27 +644,27 @@ with tab_chat:
                                 response_placeholder.markdown(full_response + "▌")
                             elif chunk["type"] == "sources":
                                 sources = chunk["sources"]
-                        
+
                         # Final response without cursor
                         response_placeholder.markdown(full_response)
-                        
+
                         # Add to history
                         st.session_state.messages.append({
                             "role": "assistant",
                             "content": full_response,
                             "sources": sources,
                         })
-                        
+
                         # Show citations
                         if sources:
                             st.markdown(_citation_badges(sources), unsafe_allow_html=True)
-                            
+
                     except Exception as e:
                         st.error(f"Error: {str(e)}")
                         # Remove the user message if failed
                         if st.session_state.messages and st.session_state.messages[-1]["role"] == "user":
                             st.session_state.messages.pop()
-                    
+
                     st.rerun()
 
 # ===========================================================================
@@ -470,6 +694,11 @@ with tab_attrs:
                     with st.expander("Raw LLM output (JSON parse failed)"):
                         st.code(cached.get("_raw", ""))
                 else:
+                    # Summary card at top
+                    summary = cached.get("_summary")
+                    if summary:
+                        _summary_card(summary)
+
                     sections = {
                         "Policy Overview": [
                             "policy_name", "insurer", "sum_insured_options",
@@ -492,8 +721,7 @@ with tab_attrs:
                         ],
                         "Claims & Renewals": [
                             "cashless_available", "network_hospitals",
-                            "claim_settlement_days", "claim_settlement_note",
-                            "portability_available", "ncb_benefit",
+                            "claim_settlement_days", "portability_available", "ncb_benefit",
                         ],
                         "Permanent Exclusions": ["permanent_exclusions"],
                     }
@@ -509,7 +737,7 @@ with tab_attrs:
                                 _attr_card(
                                     ATTR_LABELS.get(key, key),
                                     cached.get(key),
-                                    key=key,
+                                    source=src,
                                 )
 
                     # Dynamic / policy-specific partner-relevant attributes
@@ -522,7 +750,11 @@ with tab_attrs:
                         cols = st.columns(min(len(dynamic), 3))
                         for i, (key, val) in enumerate(dynamic.items()):
                             with cols[i % min(len(dynamic), 3)]:
-                                _attr_card(key.replace("_", " ").title(), val)
+                                _attr_card(
+                                    key.replace("_", " ").title(),
+                                    val,
+                                    source=src,
+                                )
 
             else:
                 st.caption("Click **Extract attributes** to auto-analyse this policy.")
