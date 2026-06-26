@@ -69,6 +69,7 @@ ATTR_LABELS: dict[str, str] = {
     "cashless_available": "Cashless Facility",
     "network_hospitals": "Network Hospitals",
     "claim_settlement_days": "Claim Settlement (days)",
+    "claim_settlement_note": "Claim Settlement Note",
     "portability_available": "Portability",
     "ncb_benefit": "No Claim Bonus",
     "permanent_exclusions": "Permanent Exclusions",
@@ -160,22 +161,40 @@ def get_chain(sources: list[str] | None) -> PolicyChain:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _render_value(v) -> str:
+def _render_value(v, key: str = "") -> str:
     if isinstance(v, list):
-        return ", ".join(str(x) for x in v)
+        return ", ".join(str(x) for x in v) if v else "Not extracted"
     if isinstance(v, bool):
         return "Yes" if v else "No"
     if v is None:
-        return "—"
+        # Context-aware null messages
+        not_applicable = {"copay_percentage", "copay_conditions", "room_rent_sublimit", "icu_sublimit"}
+        refer_insurer  = {"network_hospitals"}
+        manual_review  = {"permanent_exclusions"}
+        not_specified  = {"ncb_benefit"}
+        if key in not_applicable:
+            # Only show Not Applicable if co-pay is confirmed false
+            return "Not Applicable"
+        if key in refer_insurer:
+            return "Refer insurer network hospital list"
+        if key in manual_review:
+            return "Requires manual verification"
+        if key in not_specified:
+            return "Not specified in policy"
+        return "Not specified in policy"
     return str(v)
 
 
-def _attr_card(label: str, value) -> None:
-    val_str = _render_value(value)
+def _attr_card(label: str, value, key: str = "") -> None:
+    val_str = _render_value(value, key)
+    # Style null-equivalent values differently
+    null_values = {"Not specified in policy", "Requires manual verification",
+                   "Refer insurer network hospital list", "Not Applicable", "Not extracted"}
+    value_color = "#8b949e" if val_str in null_values else "#e6edf3"
     st.markdown(
         f'<div class="attr-card">'
         f'<div class="attr-label">{label}</div>'
-        f'<div class="attr-value">{val_str}</div>'
+        f'<div class="attr-value" style="color:{value_color}">{val_str}</div>'
         f'</div>',
         unsafe_allow_html=True,
     )
@@ -473,7 +492,8 @@ with tab_attrs:
                         ],
                         "Claims & Renewals": [
                             "cashless_available", "network_hospitals",
-                            "claim_settlement_days", "portability_available", "ncb_benefit",
+                            "claim_settlement_days", "claim_settlement_note",
+                            "portability_available", "ncb_benefit",
                         ],
                         "Permanent Exclusions": ["permanent_exclusions"],
                     }
@@ -489,6 +509,7 @@ with tab_attrs:
                                 _attr_card(
                                     ATTR_LABELS.get(key, key),
                                     cached.get(key),
+                                    key=key,
                                 )
 
                     # Dynamic / policy-specific partner-relevant attributes
