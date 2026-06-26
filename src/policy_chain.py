@@ -55,6 +55,8 @@ class PolicyChain:
             model=model,
             temperature=temperature,
             num_predict=2048,
+            num_ctx=8192,
+            extra_body={"think": False},
         )
         self._parser = StrOutputParser()
 
