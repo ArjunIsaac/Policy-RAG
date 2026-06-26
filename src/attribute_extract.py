@@ -228,8 +228,10 @@ def extract_fixed_attributes(text: str) -> dict:
         attrs["copay_conditions"] = _clean(_find([r"co[\s-]?pay[^\n]{10,200}"], text))
     else:
         attrs["copay_applicable"] = False
-        attrs["copay_percentage"] = None
-        attrs["copay_conditions"] = None
+        attrs["copay_percentage"] = None      # will display as "Not Applicable"
+        attrs["copay_conditions"] = None      # will display as "Not Applicable"
+        attrs["room_rent_sublimit"] = None    # check separately below
+        attrs["icu_sublimit"] = None          # check separately below
 
     attrs["room_rent_sublimit"] = _find([
         r"[Rr]oom\s+[Rr]ent\s+[Ss]ub.?[Ll]imit\s*[:\-–]?\s*([^\n]+)",
@@ -272,18 +274,45 @@ def extract_fixed_attributes(text: str) -> dict:
     attrs["portability_available"] = bool(re.search(
         r"[Pp]ortability|port\s+the\s+policy", text))
 
-    ncb = _find([
-        r"[Cc]umulative\s+[Bb]onus\s+means\s+([^\n]{20,200})",
-        r"[Nn]o\s+[Cc]laim\s+[Bb]onus\s+means\s+([^\n]{20,200})",
-    ], text)
-    attrs["ncb_benefit"] = _clean(ncb)
+    # NCB: try to find actual benefit amount/percentage first, fall back to description
+    ncb_pct = re.search(
+        r"[Cc]umulative\s+[Bb]onus[^\n]{0,100}?(\d+\s*%[^\n]{0,80})",
+        text
+    )
+    if ncb_pct:
+        attrs["ncb_benefit"] = _clean(ncb_pct.group(1))
+    else:
+        # Fall back to the definition but reframe it as a benefit description
+        ncb_m = re.search(r"[Cc]umulative\s+[Bb]onus\s+means\s+any\s+([^\n]{20,200})", text)
+        if not ncb_m:
+            ncb_m = re.search(r"[Nn]o\s+[Cc]laim\s+[Bb]onus\s+means\s+([^\n]{20,200})", text)
+        if ncb_m:
+            attrs["ncb_benefit"] = "Increase in Sum Insured without premium increase (see policy schedule for %)"
+        else:
+            attrs["ncb_benefit"] = None
+
+    # Claim settlement: clarify it means "after receiving all required documents"
+    cs = _find([r"settle\s+or\s+reject\s+a\s+claim[^\n]*?within\s+(\d+)\s+days"], text)
+    if cs and cs.isdigit():
+        attrs["claim_settlement_days"] = int(cs)
+        attrs["claim_settlement_note"] = f"{cs} days after receiving all required documents"
+    else:
+        attrs["claim_settlement_days"] = None
+        attrs["claim_settlement_note"] = None
 
     # ── Permanent Exclusions ──────────────────────────────────────────────
+    clean_text = re.sub(r"\*+", "", text)
+    clean_text = re.sub(r"#+\s*", "", clean_text)
+
     excl_m = re.search(
-        r"(?:Standard\s+General\s+Exclusions?|2\.\s+Standard\s+General)(.*?)"
-        r"(?:3\.\s+Specific|Section\s+D|\Z)",
-        text, re.IGNORECASE | re.DOTALL,
+        r"We\s+will\s+not\s+pay\s+for\s+any\s+claim[^\n]*\n(.*?)(?:Section\s+D|3\.\s+Specific\s+General|\Z)",
+        clean_text, re.IGNORECASE | re.DOTALL,
     )
+    if not excl_m:
+        excl_m = re.search(
+            r"(?:Standard\s+General\s+Exclusions?)(.*?)(?:3\.\s+Specific|Section\s+D|\Z)",
+            clean_text, re.IGNORECASE | re.DOTALL,
+        )
     if excl_m:
         excl_text = excl_m.group(1)
         excl_items = re.findall(
@@ -291,7 +320,7 @@ def extract_fixed_attributes(text: str) -> dict:
             excl_text,
         )
         if not excl_items:
-            excl_items = re.findall(r"\*\*([^*\n]{10,100})\*\*", excl_text)
+            excl_items = re.findall(r"Code\s*[-–]\s*Excl\d+[^\n]*\n([^\n]{10,100})", excl_text)
         attrs["permanent_exclusions"] = list(dict.fromkeys(excl_items[:12])) or None
     else:
         attrs["permanent_exclusions"] = None
@@ -307,6 +336,7 @@ def extract_dynamic_attributes(llm, parser, text: str) -> dict:
     """
     ONE LLM call on focused policy text to find partner-relevant selling points.
     Uses first 6000 chars — benefit sections are always early in the document.
+    Filters out any "Not found" / null values Mistral might return.
     """
     focused = text[:6000]
     prompt = DYNAMIC_ATTR_PROMPT.format(text=focused)
@@ -318,7 +348,13 @@ def extract_dynamic_attributes(llm, parser, text: str) -> dict:
         raw = _strip_fences(raw)
         result = json.loads(raw)
         if isinstance(result, dict):
-            return result
+            # Filter out hallucinated "Not found" / empty / null values
+            # Also filter discounts and admin items — not partner-relevant features
+            skip_keywords = ("not found", "null", "none", "n/a", "na", "-", "discount", "loading", "cancellation", "fraud", "nomination")
+            return {
+                k: v for k, v in result.items()
+                if v and not any(kw in str(v).lower() for kw in skip_keywords)
+            }
     except Exception as e:
         print(f"[attr_extract] Dynamic attributes error: {e}")
     return {}
@@ -331,8 +367,7 @@ def extract_dynamic_attributes(llm, parser, text: str) -> dict:
 def run_extraction(store: "PolicyVectorStore", llm, parser, source_filter: list[str] | None) -> dict:
     """
     Full attribute extraction pipeline.
-    Fixed fields: regex (instant).
-    Dynamic fields: 1 LLM call (~30s).
+    Fixed fields: regex (instant, zero LLM calls).
     """
     text = get_all_policy_text(store, source_filter)
     if not text:
@@ -341,9 +376,4 @@ def run_extraction(store: "PolicyVectorStore", llm, parser, source_filter: list[
     attrs = extract_fixed_attributes(text)
     found = sum(1 for v in attrs.values() if v is not None)
     print(f"[attr_extract] Regex extraction: {found}/{len(attrs)} fields found")
-
-    dynamic = extract_dynamic_attributes(llm, parser, text)
-    if dynamic:
-        attrs["_dynamic"] = dynamic
-
     return attrs
