@@ -1,5 +1,5 @@
 """
-chat_stream.py
+policy_chain.py
 --------------
 PolicyChain — the main public interface.
 
@@ -20,7 +20,6 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_openai import ChatOpenAI
 
-from attribute_extract import run_extraction
 from constants import CHAT_PROMPT, FINAL_K, MODEL_NAME
 from formatting import clean_output, extract_sources, format_docs
 from retrieval import retrieve_docs, transform_query
@@ -183,20 +182,7 @@ class PolicyChain:
         lines.append("=" * 60)
         return "\n".join(lines)
 
-    # ------------------------------------------------------------------
-    # Public: attribute extraction
-    # ------------------------------------------------------------------
-
-    def extract_attributes(self, source_filter: list[str] | None = None) -> dict:
-        """
-        Extract partner-relevant policy attributes.
-        Fixed fields  : regex, instant, zero LLM calls.
-        Dynamic fields: 1 LLM call (~30s).
-        Completely independent of the RAG chat pipeline.
-        """
-        sf = source_filter or self._source_filter
-        return run_extraction(self._store, self._llm, self._parser, sf)
-
+   
     # ------------------------------------------------------------------
     # Public: memory / filter
     # ------------------------------------------------------------------
