@@ -11,3 +11,8 @@ wheels/
 data/chroma_db/
 data/
 .env
+static/
+static/raw/vllm_env.sh
+*.log
+vllm_latest*.log
+.vscode/

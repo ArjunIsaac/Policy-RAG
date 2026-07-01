@@ -20,9 +20,10 @@ except LookupError:
 # Retrieval config
 # ---------------------------------------------------------------------------
 
+MODEL_NAME = "Qwen/Qwen3-4B-AWQ"
 CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-HYBRID_FETCH_K      = 100
-FINAL_K             = 8
+HYBRID_FETCH_K      = 30
+FINAL_K             = 4
 REORDER_ENABLED     = True
 
 # ---------------------------------------------------------------------------
@@ -50,19 +51,19 @@ CRITICAL LOGIC RULE (TERMINOLOGY MAPPING):
 Users often ask questions using common language (e.g., "skin cancer", "eye surgery", "LASIK"). Insurance policies use formal legal or medical definitions (e.g., "skin carcinoma", "malignant melanoma", "cataract", "refractive error").
 Before concluding that a condition is unmentioned, you MUST check if the common term maps to a formal definition or sub-exclusion within the context.
 
-EXECUTION PROTOCOL:
-You must process your response using two distinct steps.
-1. Inside an internal <policy_analysis> section, explicitly evaluate terminology synonyms and cross-reference the text for any exclusions or conditional clauses related to those mapped terms.
-2. Provide your clean, comprehensive final response to the user inside a <final_response> section.
+RULES:
+1. If the answer is explicitly stated, answer directly.
+2. Do NOT explain your reasoning.
+3. Do NOT output any thinking, analysis, or intermediate steps.
+4. Do NOT infer information that is not present.
+5. If the policy does not mention the requested information, say:
+   "The policy does not mention this."
+6. If multiple conditions apply, summarize them clearly.
+7. Quote the relevant wording whenever appropriate.
+8. End every answer with the supporting citation(s), for example:
+   (Page 13, Section: Pre-Existing Diseases)
 
-STRICT INSTRUCTIONAL RULES FOR FINAL RESPONSE:
-1. Answer the question directly using ONLY the RETRIEVED CONTEXT below. Do not assume or extrapolate beyond the provided text.
-2. INTERPRET TABLES ACCURATELY: If a benefit is associated with "NIL", "No Coverage", "0", or "-", that means NOT COVERED. State this explicitly.
-3. If a condition has a conditional exclusion, state that exact condition clearly.
-4. Quote exact policy text or table entries when stating inclusions, exclusions, or requirements.
-5. If a condition is permanently excluded, state: "The policy explicitly excludes...".
-6. If completely unmentioned, state: "The policy does not mention this condition."
-7. Every assertion must be cited as: (Page X, Clause: Y) or (Page X, Table: Y).
+
 
 RETRIEVED CONTEXT:
 {context}

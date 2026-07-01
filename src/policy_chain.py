@@ -4,7 +4,7 @@ chat_stream.py
 PolicyChain — the main public interface.
 
 Handles:
-  - LLM initialisation (Mistral via Ollama)
+  - LLM initialisation (vLLM via OpenAI API)
   - Chat with memory (ask / ask_stream)
   - Debug retrieval
   - Attribute extraction (delegates to attribute_extract.py)
@@ -18,10 +18,10 @@ from typing import List
 
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.output_parsers import StrOutputParser
-from langchain_ollama import ChatOllama
+from langchain_openai import ChatOpenAI
 
 from attribute_extract import run_extraction
-from constants import CHAT_PROMPT, FINAL_K
+from constants import CHAT_PROMPT, FINAL_K, MODEL_NAME
 from formatting import clean_output, extract_sources, format_docs
 from retrieval import retrieve_docs, transform_query
 from vector_store import PolicyVectorStore
@@ -39,7 +39,7 @@ class PolicyChain:
     def __init__(
         self,
         vector_store: PolicyVectorStore,
-        model: str = "qwen3:8b",
+        model: str = MODEL_NAME,
         temperature: float = 0.0,
         k_docs: int = FINAL_K,
         memory_window: int = 4,
@@ -51,12 +51,18 @@ class PolicyChain:
         self._window        = memory_window
         self._history: list[HumanMessage | AIMessage] = []
 
-        self._llm = ChatOllama(
+        # Swapped ChatOllama for ChatOpenAI pointing to local vLLM server
+        self._llm = ChatOpenAI(
             model=model,
             temperature=temperature,
-            num_predict=2048,
-            num_ctx=8192,
-            extra_body={"think": False},
+            max_tokens=384,
+            openai_api_base="http://localhost:8000/v1",
+            openai_api_key="EMPTY",  # vLLM does not require a real API key
+            extra_body={
+                "chat_template_kwargs": {
+                    "enable_thinking": False
+                }
+            }
         )
         self._parser = StrOutputParser()
 

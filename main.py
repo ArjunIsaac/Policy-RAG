@@ -14,10 +14,13 @@ import json
 import sys
 from pathlib import Path
 from urllib.parse import quote
+from langchain_openai import ChatOpenAI
 
 import streamlit as st
 
 sys.path.insert(0, str(Path(__file__).parent / "src"))
+
+from constants import MODEL_NAME
 
 from ingestor import PDFIngestor
 from vector_store import PolicyVectorStore
@@ -198,12 +201,11 @@ def get_store() -> PolicyVectorStore:
 def get_chain(sources: list[str] | None) -> PolicyChain:
     return PolicyChain(
         vector_store=get_store(),
-        model="qwen3:8b",
+        model= MODEL_NAME,  # Pass as string, not ChatOpenAI object
         temperature=0.05,
         k_docs=6,
         source_filter=sources if sources else None,
     )
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -478,7 +480,7 @@ with st.sidebar:
 
         if st.button("⚡ Index uploaded PDFs", use_container_width=True):
             store = get_store()
-            ingestor = PDFIngestor(chunk_size=1200, overlap=200)
+            ingestor = PDFIngestor(chunk_size=600, overlap=100)
             total_added = 0
             prog = st.progress(0, text="Indexing …")
             for idx, fp in enumerate(new_files):
@@ -634,6 +636,15 @@ with tab_chat:
                     response_placeholder = st.empty()
                     full_response = ""
                     sources = []
+
+
+                    try:
+                        print("=== Testing non-streaming ===")
+                        result = chain.ask(user_input)
+                        print(result["answer"])
+                        print("=============================")
+                    except Exception as e:
+                        print("Non-streaming failed:", repr(e))
 
                     try:
                         # Stream the response

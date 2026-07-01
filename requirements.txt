@@ -3,7 +3,7 @@
 #   uv pip install -r requirements.txt
 
 # PDF parsing
-pdfplumber==0.11.9
+pymupdf4llm
 
 # Vector store
 chromadb==1.5.9
@@ -14,7 +14,12 @@ langchain-core==1.4.7
 langchain-ollama==1.1.0
 langchain-chroma==1.1.0
 langchain-community
+langchain-openai
+langchain-huggingface 
+sentence-transformers
 
+# vLLM
+vllm==0.23.0
 
 # Streamlit
 streamlit==1.58.0
@@ -30,3 +35,4 @@ tqdm>=4.67
 # ML
 torch
 torchvision
+nltk

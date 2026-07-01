@@ -15,7 +15,11 @@ from typing import Any
 import chromadb
 from chromadb.config import Settings
 from langchain_chroma import Chroma
-from langchain_ollama import OllamaEmbeddings
+
+
+from langchain_core.embeddings import Embeddings
+from sentence_transformers import SentenceTransformer
+
 from langchain_community.retrievers import BM25Retriever
 from langchain_classic.retrievers import EnsembleRetriever
 from langchain_core.documents import Document
@@ -23,7 +27,8 @@ from langchain_core.documents import Document
 from datatypes import Chunk
 
 COLLECTION_NAME = "insurance_policies"
-EMBED_MODEL = "bge-m3"
+# Updated to the official Hugging Face repo ID
+EMBED_MODEL = "BAAI/bge-base-en-v1.5"
 HYBRID_FETCH_K = 20  # This is overridden in chain.py
 
 def _chunk_id(chunk: Chunk) -> str:
@@ -33,6 +38,40 @@ def _chunk_id(chunk: Chunk) -> str:
     )
     return hashlib.sha256(key.encode()).hexdigest()[:32]
 
+
+
+
+class ONNXSentenceTransformerEmbeddings(Embeddings):
+    def __init__(self, model_name: str):
+        self.model = SentenceTransformer(
+            model_name,
+            backend="onnx",
+            device="cpu",
+        )
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        embeddings = self.model.encode(
+            texts,
+            batch_size=256,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+        )
+        return embeddings.tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        embedding = self.model.encode(
+            text,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+        )
+        return embedding.tolist()
+    
+
+
+
+    
 class PolicyVectorStore:
     def __init__(
         self,
@@ -44,8 +83,10 @@ class PolicyVectorStore:
         self.persist_dir.mkdir(parents=True, exist_ok=True)
         self.collection_name = collection_name
 
-        print(f"[vector_store] Initialising embeddings ({embed_model}) …")
-        self.embeddings = OllamaEmbeddings(model=embed_model)
+        print(f"[vector_store] Initialising embeddings ({embed_model}) on CPU…")
+        # Swapped OllamaEmbeddings for HuggingFaceEmbeddings
+        # Forced to CPU so it does not steal VRAM from your vLLM server
+        self.embeddings = ONNXSentenceTransformerEmbeddings(embed_model)
 
         self._client = chromadb.PersistentClient(
             path=str(self.persist_dir),
@@ -58,7 +99,7 @@ class PolicyVectorStore:
         )
         print("[vector_store] Ready.")
 
-    def add_chunks(self, chunks: list[Chunk], batch_size: int = 32) -> int:
+    def add_chunks(self, chunks: list[Chunk], batch_size: int = 128) -> int:
         if not chunks:
             return 0
 
