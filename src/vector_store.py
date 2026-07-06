@@ -38,9 +38,6 @@ def _chunk_id(chunk: Chunk) -> str:
     )
     return hashlib.sha256(key.encode()).hexdigest()[:32]
 
-
-
-
 class ONNXSentenceTransformerEmbeddings(Embeddings):
     def __init__(self, model_name: str):
         self.model = SentenceTransformer(

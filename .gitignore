@@ -5,6 +5,7 @@ build/
 dist/
 wheels/
 *.egg-info
+src/__pycache__/
 
 # Virtual environments
 .venv
@@ -16,3 +17,4 @@ static/raw/vllm_env.sh
 *.log
 vllm_latest*.log
 .vscode/
+vllm_env.sh
