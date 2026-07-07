@@ -20,7 +20,7 @@ from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_openai import ChatOpenAI
 
-from attribute_extract import run_extraction
+from extract_attribute import run_extraction
 from constants import CHAT_PROMPT, FINAL_K, MODEL_NAME
 from formatting import clean_output, extract_sources, format_docs
 from retrieval import retrieve_docs, transform_query

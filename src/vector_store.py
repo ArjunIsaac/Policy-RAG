@@ -39,7 +39,29 @@ def _chunk_id(chunk: Chunk) -> str:
     return hashlib.sha256(key.encode()).hexdigest()[:32]
 
 
+def _build_embedding_text(chunk: Chunk) -> str:
+    """
+    Build the text that is embedded into the vector database.
 
+    We prepend structural information (headings) because it contains
+    strong semantic signals that improve retrieval, while leaving the
+    original chunk text unchanged for the LLM.
+    """
+    parts = []
+
+    heading = chunk.metadata.get("heading", "").strip()
+    clause = chunk.metadata.get("clause", "").strip()
+
+    if heading:
+        parts.append(f"Heading: {heading}")
+
+    # Avoid duplicate heading/clause if they're identical
+    if clause and clause != heading:
+        parts.append(f"Clause: {clause}")
+
+    parts.append(chunk.text)
+
+    return "\n\n".join(parts)
 
 class ONNXSentenceTransformerEmbeddings(Embeddings):
     def __init__(self, model_name: str):
@@ -68,8 +90,6 @@ class ONNXSentenceTransformerEmbeddings(Embeddings):
         )
         return embedding.tolist()
     
-
-
 
     
 class PolicyVectorStore:
@@ -124,7 +144,7 @@ class PolicyVectorStore:
                 "heading": chunk.metadata.get("heading", ""),
                 "parent_text": chunk.metadata.get("parent_text", chunk.text),
             }
-            texts.append(chunk.text)
+            texts.append(_build_embedding_text(chunk))
             metadatas.append(meta)
             ids.append(cid)
 

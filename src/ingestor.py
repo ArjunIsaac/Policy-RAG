@@ -121,7 +121,7 @@ def _chunk_table(
 # ---------------------------------------------------------------------------
 
 class PDFIngestor:
-    def __init__(self, chunk_size: int = 1200, overlap: int = 200, table_max_chars: int | None = None):
+    def __init__(self, chunk_size: int = 800, overlap: int = 100, table_max_chars: int | None = None):
         # Markdown splitter keeps contextual headers attached to the chunks
         self.md_splitter = MarkdownHeaderTextSplitter(
             headers_to_split_on=[
