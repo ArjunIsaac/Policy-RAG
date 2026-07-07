@@ -18,4 +18,4 @@ static/raw/vllm_env.sh
 vllm_latest*.log
 .vscode/
 vllm_env.sh
-.DS_store
+.DS_Store
