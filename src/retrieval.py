@@ -39,34 +39,72 @@ def remove_stopwords(text: str) -> str:
 
 
 def transform_query(query: str) -> str:
-    """Expand query with insurance-domain synonyms for better retrieval."""
+
+
     q = query
     ql = query.lower()
 
-    if any(t in ql for t in ["cancer", "carcinoma", "melanoma", "tumor"]):
-        q += " critical illness definition carcinoma melanoma tumor malignancy"
-    if any(t in ql for t in ["excluded", "exclusion", "not covered"]):
-        q += " permanent exclusion standard exclusions limits"
-    if any(t in ql for t in ["waiting", "period"]):
-        q += " waiting period pre-existing specific illness cataract"
-    if any(t in ql for t in ["copay", "co-pay"]):
-        q += " co-payment"
-    if any(t in ql for t in ["eye", "cataract", "lasik", "surgery", "surgeries", "vision", "eyesight"]):
-        q += " limit sublimit cap NIL table benefit cataract refractive error dioptres eyesight correction"
+    synonym_map = {
+        "ped": ["pre existing disease", "pre-existing disease"],
+        "pre existing": ["pre-existing"],
+        "copay": ["co-payment", "co payment"],
+        "co-pay": ["co-payment"],
+        "copayment": ["co-payment"],
+        "ncb": ["no claim bonus"],
+        "icu": ["intensive care unit"],
+        "opd": ["outpatient", "out patient"],
+        "ayush": [
+            "ayurveda",
+            "yoga",
+            "unani",
+            "siddha",
+            "homeopathy",
+        ],
+        "maternity": ["pregnancy", "childbirth"],
+        "hospitalisation": ["hospitalization"],
+        "hospitalization": ["hospitalisation"],
+    }
+
+    additions = []
+
+    for key, synonyms in synonym_map.items():
+        if key in ql:
+            additions.extend(synonyms)
+
+    # Remove duplicates while preserving order
+    seen = set()
+    additions = [
+        s for s in additions
+        if not (s.lower() in seen or seen.add(s.lower()))
+    ]
+
+    if additions:
+        q += " " + " ".join(additions)
 
     return q
 
 
 def extract_condition(query: str) -> str | None:
-    """Pull out a medical/legal condition name from the query for forced retrieval."""
-    normalized = query.replace("–", "-").replace("—", "-").lower()
-    keywords = ["cancer", "carcinoma", "melanoma", "tumor", "eye", "cataract", "lasik", "refractive"]
-    for kw in keywords:
-        if kw in normalized:
-            m = re.search(r"([a-z0-9\-\s]+?\b" + kw + r"\b)", normalized)
-            if m:
-                return m.group(1).strip()
-    return None
+
+
+    q = query.lower()
+
+    words = re.findall(r"[a-zA-Z][a-zA-Z0-9\-']+", q)
+
+    stopwords = {
+        "what", "is", "the", "a", "an",
+        "for", "of", "on", "under",
+        "does", "do",
+        "can", "may",
+        "please",
+    }
+
+    keywords = [w for w in words if w not in stopwords]
+
+    if not keywords:
+        return None
+
+    return " ".join(keywords)
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +230,7 @@ def retrieve_docs(
         "cancer", "carcinoma", "melanoma", "tumor",
         "eye", "surgery", "cataract", "lasik", "refractive",
     ])
-    search_type = "similarity" if is_targeted else "mmr"
+    search_type = "similarity"
 
     # 1. Hybrid retrieval
     hybrid = store.as_hybrid_retriever(
@@ -204,32 +242,62 @@ def retrieve_docs(
 
     # 2. Forced chunks for targeted queries
     forced_docs: List[Document] = []
-    if is_targeted:
+    ENABLE_FORCED_RETRIEVAL = False # FLAG FOR BENCHMARK
+    if is_targeted and ENABLE_FORCED_RETRIEVAL:
+
         print("[retrieval] Targeted query — injecting forced chunks")
         sys.stdout.flush()
         condition = extract_condition(query)
+
         forced_docs = fetch_forced_chunks(store, source_filter, condition)
 
-    # 3. Expand to parent_text, deduplicate
+    # 3. Cross-encoder rerank ALL retrieved child chunks
+    cross_enc = get_cross_encoder()
+
+    if raw_docs:
+        pairs = []
+
+        for doc in raw_docs:
+            text = doc.page_content
+
+            heading = doc.metadata.get("heading", "")
+            clause = doc.metadata.get("clause", "")
+
+            # Give the reranker structural context
+            if heading:
+                text = f"Heading: {heading}\n\n{text}"
+
+            if clause and clause != heading:
+                text = f"Clause: {clause}\n\n{text}"
+
+            pairs.append((query, text))
+
+        scores = cross_enc.predict(pairs)
+
+        scored_docs = sorted(
+            zip(raw_docs, scores),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+
+    else:
+        scored_docs = []
+
+    # 4. Deduplicate AFTER reranking
     parent_map: Dict[str, Document] = {}
-    for doc in raw_docs:
+
+    for doc, _ in scored_docs:
         parent = doc.metadata.get("parent_text", doc.page_content)
+
         if parent not in parent_map:
             parent_map[parent] = doc
-    expanded = list(parent_map.values())
+
+    reranked = list(parent_map.values())
 
     if debug:
-        print(f"[retrieval] Expanded to {len(expanded)} unique parents")
+        print(f"[retrieval] Reranked {len(raw_docs)} child chunks")
+        print(f"[retrieval] Kept {len(reranked)} unique parents")
         sys.stdout.flush()
-
-    # 4. Cross-encoder reranking
-    cross_enc = get_cross_encoder()
-    if expanded:
-        pairs  = [(query, doc.page_content) for doc in expanded]
-        scores = cross_enc.predict(pairs)
-        reranked = [doc for doc, _ in sorted(zip(expanded, scores), key=lambda x: x[1], reverse=True)]
-    else:
-        reranked = []
 
     # 5. Merge: forced first, then reranked (no duplicates)
     forced_keys = {(d.metadata.get("page"), d.metadata.get("heading")) for d in forced_docs}

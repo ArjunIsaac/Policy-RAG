@@ -32,13 +32,19 @@ Activate the virtual environment:
 source .venv/bin/activate
 ```
 
+Activate vLLM environment config script (Linux Only)
+```bash
+source vllm_env.sh
+```
+
 Run:
 
 ```bash
 python3 -m vllm.entrypoints.openai.api_server \
     --model Qwen/Qwen3-4B-AWQ \
     --quantization awq_marlin \
-    --max-model-len 4096
+    --max-model-len 4096 \
+    --gpu-memory-utilization 0.80
 ```
 
 Wait until the server finishes loading before starting the RAG application.
