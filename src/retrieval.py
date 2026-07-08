@@ -107,6 +107,16 @@ def extract_condition(query: str) -> str | None:
     return " ".join(keywords)
 
 
+def adaptive_final_k(query : str) -> int:
+    # Determine the final number of fetched docs based on query enumeration
+    q = query.lower()
+    enumeration_words = {'list', 'show', 'all', 'every','each','compare','different','various', 'several'}
+    q_tokens = set(q.replace("/"," ").split())
+    
+    if enumeration_words & q_tokens:
+        return 8
+    else:
+        return FINAL_K
 # ---------------------------------------------------------------------------
 # Forced chunk injection
 # ---------------------------------------------------------------------------
@@ -239,6 +249,24 @@ def retrieve_docs(
         search_type=search_type,
     )
     raw_docs: List[Document] = hybrid.invoke(query) or []
+    
+    if debug:
+        print("\n=== Hybrid Retrieval ===")
+
+        for i, doc in enumerate(raw_docs[:15]):
+            heading = doc.metadata.get("heading", "") or doc.metadata.get("clause", "")
+            print(
+                f"{i+1:2d}. "
+                f"Page {doc.metadata.get('page','?')} | "
+                f"{heading}"
+            )
+
+        print("=" * 60)
+
+    if debug:
+        print('[retrieval] ====Hybrid retrieval===')
+        for i, doc in enumerate(raw_docs[:15]):
+            print(f"  {i+1}: Page {doc.metadata.get('page','?')} | {doc.metadata.get('heading','?')}")
 
     # 2. Forced chunks for targeted queries
     forced_docs: List[Document] = []
@@ -280,6 +308,20 @@ def retrieve_docs(
             reverse=True,
         )
 
+        if debug:
+            print("\n=== Cross Encoder Rankings ===")
+
+            for i, (doc, score) in enumerate(scored_docs[:15]):
+                heading = doc.metadata.get("heading", "") or doc.metadata.get("clause", "")
+                print(
+                    f"{i+1:2d}. "
+                    f"Score={score:.4f} | "
+                    f"Page {doc.metadata.get('page','?')} | "
+                    f"{heading}"
+                )
+
+            print("=" * 60)
+
     else:
         scored_docs = []
 
@@ -310,6 +352,7 @@ def retrieve_docs(
     # 6. Reorder + truncate
     if REORDER_ENABLED and final:
         final = LongContextReorder().transform_documents(final)
+    k = adaptive_final_k(query)
     final = final[:k]
 
     if debug:

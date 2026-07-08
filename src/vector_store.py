@@ -29,7 +29,7 @@ from datatypes import Chunk
 COLLECTION_NAME = "insurance_policies"
 # Updated to the official Hugging Face repo ID
 EMBED_MODEL = "BAAI/bge-base-en-v1.5"
-HYBRID_FETCH_K = 20  # This is overridden in chain.py
+HYBRID_FETCH_K = 20  
 
 def _chunk_id(chunk: Chunk) -> str:
     key = (

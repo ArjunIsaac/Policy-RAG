@@ -24,7 +24,7 @@ MODEL_NAME = "Qwen/Qwen3-4B-AWQ"
 CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 HYBRID_FETCH_K      = 30
 FINAL_K             = 4
-REORDER_ENABLED     = True
+REORDER_ENABLED     = False # testing, toggle on off to see if reordering improves results
 
 # ---------------------------------------------------------------------------
 # Stopwords
