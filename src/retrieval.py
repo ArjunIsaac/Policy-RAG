@@ -29,9 +29,7 @@ from constants import (
 if TYPE_CHECKING:
     from vector_store import PolicyVectorStore
 
-# ---------------------------------------------------------------------------
-# Query transformation
-# ---------------------------------------------------------------------------
+# Helper functions
 
 def remove_stopwords(text: str) -> str:
     words = text.lower().split()
@@ -117,9 +115,9 @@ def adaptive_final_k(query : str) -> int:
         return 8
     else:
         return FINAL_K
-# ---------------------------------------------------------------------------
+
+
 # Forced chunk injection
-# ---------------------------------------------------------------------------
 
 def fetch_forced_chunks(
     store: "PolicyVectorStore",
@@ -199,9 +197,7 @@ def fetch_forced_chunks(
         return []
 
 
-# ---------------------------------------------------------------------------
 # Cross-encoder (lazy singleton)
-# ---------------------------------------------------------------------------
 
 _cross_encoder: CrossEncoder | None = None
 
@@ -214,6 +210,50 @@ def get_cross_encoder() -> CrossEncoder:
         _cross_encoder = CrossEncoder(CROSS_ENCODER_MODEL, device="cpu")
     return _cross_encoder
 
+
+def build_reranker_text(doc: Document) -> str:
+    """
+    Build a semantically rich passage for the cross-encoder.
+    This text is ONLY used for reranking.
+    It is never shown to the LLM.
+    """
+
+    md = doc.metadata
+
+    parts = []
+
+    heading = md.get("heading")
+    if heading:
+        parts.append(f"Section: {heading}")
+
+    clause = md.get("clause")
+    if clause and clause != heading:
+        parts.append(f"Clause: {clause}")
+
+    chunk_type = md.get("type")
+    if chunk_type:
+        parts.append(f"Content Type: {chunk_type}")
+
+    tags = md.get("tags")
+    if tags:
+        parts.append(f"Tags: {', '.join(tags)}")
+
+    if md.get("is_definition"):
+        parts.append("Contains: Definition")
+
+    metadata = doc.metadata
+
+    chunk_type = metadata.get("type", "")
+
+    if chunk_type.startswith("table"):
+        passage = metadata.get("embedding_text", doc.page_content)
+    else:
+        passage = doc.page_content
+
+    parts.append("Passage:")
+    parts.append(passage)
+
+    return "\n\n".join(parts)
 
 # ---------------------------------------------------------------------------
 # Main retrieval pipeline
@@ -249,6 +289,12 @@ def retrieve_docs(
         search_type=search_type,
     )
     raw_docs: List[Document] = hybrid.invoke(query) or []
+
+    hybrid_rank = {
+        id(doc): rank
+        for rank, doc in enumerate(raw_docs, start=1)
+    }
+
     
     if debug:
         print("\n=== Hybrid Retrieval ===")
@@ -269,6 +315,7 @@ def retrieve_docs(
             print(f"  {i+1}: Page {doc.metadata.get('page','?')} | {doc.metadata.get('heading','?')}")
 
     # 2. Forced chunks for targeted queries
+    
     forced_docs: List[Document] = []
     ENABLE_FORCED_RETRIEVAL = False # FLAG FOR BENCHMARK
     if is_targeted and ENABLE_FORCED_RETRIEVAL:
@@ -283,28 +330,46 @@ def retrieve_docs(
     cross_enc = get_cross_encoder()
 
     if raw_docs:
-        pairs = []
-
-        for doc in raw_docs:
-            text = doc.page_content
-
-            heading = doc.metadata.get("heading", "")
-            clause = doc.metadata.get("clause", "")
-
-            # Give the reranker structural context
-            if heading:
-                text = f"Heading: {heading}\n\n{text}"
-
-            if clause and clause != heading:
-                text = f"Clause: {clause}\n\n{text}"
-
-            pairs.append((query, text))
+        pairs = [ (query, build_reranker_text(doc)) for doc in raw_docs ]
 
         scores = cross_enc.predict(pairs)
 
         scored_docs = sorted(
             zip(raw_docs, scores),
             key=lambda x: x[1],
+            reverse=True,
+        )
+
+        ce_rank = {
+            id(doc): rank
+            for rank, (doc, _) in enumerate(scored_docs, start=1)
+        }
+
+        ce_score_lookup = {
+            id(doc): score
+            for doc, score in scored_docs
+        }
+
+        RRF_K = 20
+        rrf_scores = []
+
+        for doc in raw_docs:
+            h = hybrid_rank[id(doc)]
+            c = ce_rank[id(doc)]
+
+            score = (
+                1 / (RRF_K + h)
+                + 1 / (RRF_K + c)
+            )
+
+            rrf_scores.append((doc, score))
+
+        scored_docs = sorted(
+            rrf_scores,
+            key=lambda x: (
+                x[1],
+                ce_score_lookup[id(x[0])]
+            ),
             reverse=True,
         )
 
@@ -324,6 +389,8 @@ def retrieve_docs(
 
     else:
         scored_docs = []
+
+
 
     # 4. Deduplicate AFTER reranking
     parent_map: Dict[str, Document] = {}

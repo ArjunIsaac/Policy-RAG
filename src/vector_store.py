@@ -65,9 +65,6 @@ class ONNXSentenceTransformerEmbeddings(Embeddings):
         )
         return embedding.tolist()
     
-
-
-
     
 class PolicyVectorStore:
     def __init__(
