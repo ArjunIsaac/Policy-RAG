@@ -33,13 +33,6 @@ _TAG_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Matches a contiguous block of markdown table lines:
-#   |  col | col | col  |
-#   |  --- | --- | ---  |
-#   |  val | val | val  |
-# A table block is a run of 2+ lines that each start with "|" (allowing
-# leading whitespace), where the second line is a header-separator row
-# (only -, :, |, and whitespace).
 _TABLE_BLOCK_RE = re.compile(
     r"(?:^[ \t]*\|.*\|[ \t]*\n)"        # header row
     r"(?:^[ \t]*\|[\s\-:|]*\|[ \t]*\n)"  # separator row (---|---|---)
@@ -54,30 +47,168 @@ def _tags(text: str) -> list[str]:
     return list({m.group(0).strip().lower() for m in _TAG_RE.finditer(text)})
 
 
-def _split_text_around_tables(text: str) -> list[tuple[str, bool]]:
-    """
-    Split markdown text into an ordered list of (segment, is_table) tuples.
-    Table segments are returned verbatim and untouched; everything else is
-    plain prose that the caller can still run through normal splitting.
-    """
-    segments: list[tuple[str, bool]] = []
+from typing import Literal
+
+SegmentType = Literal["prose", "table", "table_context"]
+
+
+def _split_text_around_tables(
+    text: str,
+    context_before: int = 350,
+    context_after: int = 200,
+) -> list[tuple[str, SegmentType]]:
+
+
+    segments: list[tuple[str, SegmentType]] = []
+
     pos = 0
+
     for match in _TABLE_BLOCK_RE.finditer(text):
         start, end = match.span()
+
+        #
+        # Prose before the table
+        #
         if start > pos:
-            prose = text[pos:start]
-            if prose.strip():
-                segments.append((prose, False))
+            prose = text[pos:start].strip()
+
+            if prose:
+                segments.append((prose, "prose"))
+
+        #
+        # Raw table
+        #
         table_text = match.group(0).rstrip("\n")
+
         if table_text.strip():
-            segments.append((table_text, True))
+
+            segments.append((table_text, "table"))
+
+            #
+            # Contextual table
+            #
+            before_start = max(0, start - context_before)
+            after_end = min(len(text), end + context_after)
+
+            before = text[before_start:start].strip()
+            after = text[end:after_end].strip()
+
+            contextual_chunk = "\n\n".join(
+                part
+                for part in (before, table_text, after)
+                if part.strip()
+            )
+
+            segments.append((contextual_chunk, "table_context"))
+
         pos = end
+
+    #
+    # Remaining prose
+    #
     if pos < len(text):
-        tail = text[pos:]
-        if tail.strip():
-            segments.append((tail, False))
+        prose = text[pos:].strip()
+
+        if prose:
+            segments.append((prose, "prose"))
+
     return segments
 
+
+def build_table_embedding_text(
+    heading: str,
+    table_text: str,
+    segment_type: str = "table",
+) -> str:
+    """
+    Produce a semantic representation of a markdown table.
+
+    The original markdown is preserved, but we prepend a
+    natural-language description that embedding models understand
+    much better.
+    """
+
+    lines = [l.rstrip() for l in table_text.splitlines() if l.strip()]
+
+    if len(lines) < 2:
+        return table_text
+
+    header = lines[0]
+
+    columns = [
+        c.strip("* ").strip()
+        for c in header.strip("|").split("|")
+    ]
+
+    data_rows = []
+
+    for row in lines[2:]:
+        cells = [
+            c.strip("* ").strip()
+            for c in row.strip("|").split("|")
+        ]
+
+        if any(cells):
+            data_rows.append(cells)
+
+    row_count = len(data_rows)
+
+    preview = []
+
+    for row in data_rows[:8]:
+        preview.append(", ".join(row))
+
+    preview_text = "\n".join(f"- {r}" for r in preview)
+
+    key_entities = []
+
+    for row in data_rows[:20]:
+        if row:
+            key_entities.append(row[0])
+
+    key_entities = list(dict.fromkeys(key_entities))
+
+
+    if segment_type == "table":
+        summary = (
+            "This chunk contains the extracted table itself. "
+            "Each row represents a structured record."
+        )
+    elif segment_type == "table_context":
+        summary = (
+            "This chunk contains a structured table together with the "
+            "surrounding explanatory text from the same section."
+        )
+
+    description = f"""
+    Heading:
+    {heading or "Untitled Section"}
+
+    Content Type:
+    Structured Table
+
+    Summary:
+    {summary}
+
+    Columns:
+    {", ".join(columns)}
+
+    Number of Rows:
+    {row_count}
+
+
+    Key Entities:
+    {", ".join(key_entities)}
+
+
+    Example Records:
+    {preview_text}
+
+    Original Markdown Table:
+
+    """
+
+    return description + table_text
 
 def _chunk_table(
     table_text: str,
@@ -158,6 +289,29 @@ class PDFIngestor:
         # Extract page by page to maintain page number metadata
         try:
             md_pages = pymupdf4llm.to_markdown(str(pdf_path), page_chunks=True)
+            print(type(md_pages))
+
+            DEBUG_SAVE_MARKDOWN = True
+
+            if DEBUG_SAVE_MARKDOWN:
+
+                with open("debug_markdown.md", "w", encoding="utf-8") as f:
+
+                    if isinstance(md_pages, str):
+                        f.write(md_pages)
+
+                    else:
+                        for i, page in enumerate(md_pages):
+                            f.write("=" * 80 + "\n")
+                            f.write(f"PAGE {i+1}\n")
+                            f.write("=" * 80 + "\n\n")
+
+                            # dump everything in the dict
+                            for key, value in page.items():
+                                f.write(f"## {key}\n")
+                                f.write(str(value))
+                                f.write("\n\n")
+
         except Exception as e:
             raise RuntimeError(f"Failed to process PDF with pymupdf4llm: {e}")
 
@@ -201,18 +355,16 @@ class PDFIngestor:
                 #    splitter, so tables are never sliced mid-row.
                 segments = _split_text_around_tables(split.page_content)
 
-                for segment_text, is_table in segments:
-                    if is_table:
+                for segment_text, segment_type in segments:
+                    if segment_type in ("table", "table_context"):
                         sub_texts = _chunk_table(segment_text, self.table_max_chars)
                     else:
                         sub_texts = self.text_splitter.split_text(segment_text)
 
                     for sub_text in sub_texts:
                         word_count = len(sub_text.split())
-                        # Ignore tiny artifact chunks, but never drop a table
-                        # purely for being "short" — a 3-row table can be
-                        # under 10 words and still be the entire answer.
-                        if word_count < 10 and not is_table:
+
+                        if word_count < 10 and not segment_type.startswith("table"):
                             continue
 
                         tags = _tags(sub_text)
@@ -221,9 +373,14 @@ class PDFIngestor:
                             tags.append("definition")
                         if "critical illness" in heading.lower() and "critical_illness" not in tags:
                             tags.append("critical_illness")
-                        if is_table:
+                        if segment_type == "table" and "table" not in tags:
                             tags.append("table")
 
+                        if segment_type.startswith("table"):
+                            embedding_text = build_table_embedding_text(heading=heading, table_text=sub_text,segment_type=segment_type)
+
+                        else:
+                            embedding_text = (f"Heading: {heading}\n\n{sub_text}" if heading else sub_text)
                         chunk = Chunk(
                             text=sub_text,
                             metadata={
@@ -232,10 +389,12 @@ class PDFIngestor:
                                 "line": 1,  # Line numbers are less precise in MD, defaulting to 1
                                 "clause": heading,
                                 "heading": heading,
-                                "type": "table" if is_table else "text",
+                                "type": segment_type,
                                 "tags": tags,
                                 "parent_text": parent_text,
                                 "is_definition": is_definition,
+                                "embedding_text": embedding_text,
+                                
                             },
                         )
                         all_chunks.append(chunk)

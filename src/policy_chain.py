@@ -19,6 +19,7 @@ from typing import List
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.output_parsers import StrOutputParser
 from langchain_openai import ChatOpenAI
+from transformers import AutoTokenizer
 
 from constants import CHAT_PROMPT, FINAL_K, MODEL_NAME
 from formatting import clean_output, extract_sources, format_docs
@@ -50,6 +51,7 @@ class PolicyChain:
         self._window        = memory_window
         self._history: list[HumanMessage | AIMessage] = []
 
+
         # Swapped ChatOllama for ChatOpenAI pointing to local vLLM server
         self._llm = ChatOpenAI(
             model=model,
@@ -64,6 +66,7 @@ class PolicyChain:
             }
         )
         self._parser = StrOutputParser()
+        self._tokenizer= AutoTokenizer.from_pretrained(model,trust_remote_code=True)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -82,6 +85,69 @@ class PolicyChain:
             debug=debug,
         )
 
+
+    def _build_budgeted_context(self,docs,question: str,):
+        """
+        Build the RAG context while staying inside the model's context window.
+        """
+
+        MAX_MODEL_CONTEXT = 4096
+        MAX_OUTPUT_TOKENS = 384
+        SAFETY_MARGIN = 150
+
+        # Prompt without retrieved context
+        base_messages = CHAT_PROMPT.format_messages(
+            context="",
+            chat_history=self._trimmed_history(),
+            question=question,
+        )
+
+        base_tokens = 0
+        for m in base_messages:
+            base_tokens += len(
+                self._tokenizer.encode(
+                    m.content,
+                    add_special_tokens=False,
+                )
+            )
+
+        available = (
+            MAX_MODEL_CONTEXT
+            - MAX_OUTPUT_TOKENS
+            - SAFETY_MARGIN
+            - base_tokens
+        )
+
+        context_parts = []
+        used = 0
+        kept_docs = []
+
+        for doc in docs:
+
+            formatted = format_docs([doc])
+
+            n_tokens = len(
+                self._tokenizer.encode(
+                    formatted,
+                    add_special_tokens=False,
+                )
+            )
+
+            if used + n_tokens > available:
+                break
+
+            context_parts.append(formatted)
+            kept_docs.append(doc)
+            used += n_tokens
+
+        print(
+            f"[chain] Context budget: "
+            f"{used}/{available} tokens "
+            f"({len(kept_docs)}/{len(docs)} docs)"
+        )
+
+        return "\n\n".join(context_parts), kept_docs
+        
     # ------------------------------------------------------------------
     # Public: chat
     # ------------------------------------------------------------------
@@ -96,7 +162,13 @@ class PolicyChain:
         docs     = self._retrieve(expanded)
         t2 = time.time(); print(f"[chain] Docs retrieved    : {t2-t1:.2f}s"); sys.stdout.flush()
 
-        context  = format_docs(docs)
+        context, docs = self._build_budgeted_context(
+        docs,
+        question,
+        )
+
+
+
         messages = CHAT_PROMPT.format_messages(
             context=context,
             chat_history=self._trimmed_history(),
@@ -118,7 +190,10 @@ class PolicyChain:
         """Streaming ask — yields {type: 'text'|'sources', ...} dicts."""
         expanded = transform_query(question)
         docs     = self._retrieve(expanded)
-        context  = format_docs(docs)
+        context, docs = self._build_budgeted_context(
+            docs,
+            question,
+        )
         messages = CHAT_PROMPT.format_messages(
             context=context,
             chat_history=self._trimmed_history(),

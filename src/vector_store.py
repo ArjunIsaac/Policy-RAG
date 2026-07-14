@@ -121,7 +121,7 @@ class PolicyVectorStore:
                 "heading": chunk.metadata.get("heading", ""),
                 "parent_text": chunk.metadata.get("parent_text", chunk.text),
             }
-            texts.append(chunk.text)
+            texts.append(chunk.metadata.get("embedding_text", chunk.text))
             metadatas.append(meta)
             ids.append(cid)
 
