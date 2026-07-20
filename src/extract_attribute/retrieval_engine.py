@@ -193,12 +193,30 @@ class SmartRetriever:
         attribute_chunks = defaultdict(list)
         
         for chunk in chunks:
+            metadata = chunk.metadata or {}
+
             content = chunk.content.lower()
-            
+
+            heading_full = metadata.get("heading_full", "").lower()
+
+            heading_path = metadata.get("heading_path", "").lower()
+            # Rich text used only for scoring
+            retrieval_text = f"""
+            {heading_full}
+
+            {heading_path}
+
+            {content}
+            """.lower()
+
             for attr_name, config in CRITICAL_ATTRIBUTES.items():
-                score = self._calculate_relevance_score(content, attr_name, config)
-                
-                if score > 0.2:  # Minimum relevance threshold
+                score = self._calculate_relevance_score(
+                    retrieval_text,
+                    attr_name,
+                    config
+                )
+
+                if score > 0.2:
                     attribute_chunks[attr_name].append({
                         "chunk": chunk,
                         "score": score,

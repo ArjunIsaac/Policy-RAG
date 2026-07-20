@@ -3,17 +3,12 @@ ingestor.py
 -----------
 Parses insurance policy PDFs using pymupdf4llm.
 Leverages Markdown structure for intelligent, hierarchy-aware chunking.
-
-Tables are treated as first-class, atomic units: a markdown table is never
-split mid-row by the prose splitter, and its header row is always preserved
-so a retrieved chunk is self-describing (e.g. a "Sum Insured / Room Rent /
-Copay" row still carries those column labels even if it's the only chunk
-the retriever returns).
 """
 
 from __future__ import annotations
 
 import re
+import unicodedata
 from pathlib import Path
 
 import pymupdf4llm
@@ -50,6 +45,77 @@ def _tags(text: str) -> list[str]:
 from typing import Literal
 
 SegmentType = Literal["prose", "table", "table_context"]
+
+
+def normalize_text(text: str) -> str:
+    """
+    Conservative text normalization for insurance policy documents.
+
+    Safe operations only:
+    - Unicode normalization
+    - Remove control characters
+    - Replace common ligatures
+    - Normalize whitespace
+    - Normalize quotes/dashes
+    """
+
+    if not text:
+        return ""
+
+    # Unicode normalization
+    text = unicodedata.normalize("NFKC", text)
+
+    # Replace common ligatures
+    ligatures = {
+        "ﬁ": "fi",
+        "ﬂ": "fl",
+        "ﬀ": "ff",
+        "ﬃ": "ffi",
+        "ﬄ": "ffl",
+    }
+
+    for bad, good in ligatures.items():
+        text = text.replace(bad, good)
+
+    # Smart quotes → normal quotes
+    text = (
+        text.replace("“", '"')
+            .replace("”", '"')
+            .replace("‘", "'")
+            .replace("’", "'")
+    )
+
+    # Long dashes
+    text = (
+        text.replace("–", "-")
+            .replace("—", "-")
+    )
+
+    # Bullet variants
+    text = (
+        text.replace("•", "-")
+            .replace("▪", "-")
+            .replace("◦", "-")
+    )
+
+    # Remove zero-width characters
+    text = re.sub(r'[\u200B-\u200D\uFEFF]', '', text)
+
+    # Replace non-breaking spaces
+    text = text.replace("\u00A0", " ")
+
+    # Collapse spaces/tabs
+    text = re.sub(r"[ \t]+", " ", text)
+
+    # Collapse excessive blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+
+    # Remove trailing spaces
+    text = "\n".join(line.rstrip() for line in text.splitlines())
+
+    return text.strip()
+
+
 
 
 def _split_text_around_tables(
@@ -247,6 +313,86 @@ def _chunk_table(
     return pieces or [table_text]
 
 
+import re
+
+def enhance_document_structure(text: str) -> str:
+    """
+    Generic structure enhancement for any insurance policy.
+    No hardcoded policy names or specific keywords.
+    """
+    
+    # ===== 1. Detect and normalize numbered sections =====
+    # Pattern: "1. Section Title" or "1) Section Title"
+    section_pattern = re.compile(r'(?m)^(\d+)[\.\)]\s*([A-Z][A-Za-z\s]+)$')
+    
+    def format_section(match):
+        num = match.group(1)
+        title = match.group(2).strip()
+        # Only if it looks like a meaningful section (not a short fragment)
+        if len(title) > 5 and any(c.isupper() for c in title):
+            return f"**Section {num}: {title}**\n\n"
+        return match.group(0)
+    
+    text = section_pattern.sub(format_section, text)
+    
+    # ===== 2. Detect and normalize lists =====
+    # Pattern: "i. item" or "a. item" or "1. item"
+    # Replace with consistent "•" bullets for embedding
+    def normalize_bullet(match):
+        return "• " + match.group(1).strip()
+    
+    # Roman numerals (i., ii., iii., etc.)
+    roman_pattern = re.compile(r'(?m)^\s*([ivx]+)\.\s*(.+)$')
+    text = roman_pattern.sub(r'• \2', text)
+    
+    # Letters (a., b., c., etc.)
+    letter_pattern = re.compile(r'(?m)^\s*([a-z])\.\s*(.+)$')
+    text = letter_pattern.sub(r'• \2', text)
+    
+    # Numbers (1., 2., 3., etc.)
+    number_pattern = re.compile(r'(?m)^\s*(\d+)\.\s*(.+)$')
+    text = number_pattern.sub(r'• \2', text)
+    
+    # ===== 3. Detect "Exclusion" sections generically =====
+    # Add structural markers around exclusion sections
+    exclusion_pattern = re.compile(
+        r'(?i)(exclusion|excluded|not cover|not payable|not indemnify)',
+        re.MULTILINE
+    )
+    
+    # Only add marker if it's at the start of a line or follows a heading
+    lines = text.split('\n')
+    enhanced_lines = []
+    in_exclusion_section = False
+    
+    for line in lines:
+        # Check if this line starts a heading with a section number
+        heading_match = re.match(r'^\s*(\d+)\.?\s*([A-Z][a-zA-Z\s]+)', line)
+        if heading_match:
+            # Reset section tracking
+            in_exclusion_section = False
+        
+        # Check if this line is about exclusions (at the start of a line)
+        if re.match(r'(?i)^\s*(exclusion|not cover|not payable)', line):
+            if not in_exclusion_section:
+                in_exclusion_section = True
+                enhanced_lines.append("## EXCLUSION SECTION\n")
+        
+        enhanced_lines.append(line)
+    
+    text = '\n'.join(enhanced_lines)
+    
+    # ===== 4. Add code identifiers to numbered sections =====
+    # Generic: "Section 15" becomes "Section 15 - Code-SEC015"
+    text = re.sub(
+        r'(?m)^\*\*Section\s+(\d+):\s*(.+?)\*\*',
+        r'**Section \1: \2 - Code-SEC\1**',
+        text
+    )
+    
+    return text
+
+
 # ---------------------------------------------------------------------------
 # Public ingestor
 # ---------------------------------------------------------------------------
@@ -276,12 +422,13 @@ class PDFIngestor:
         # and we'd rather keep it whole if it's even somewhat oversized.
         self.table_max_chars = table_max_chars or max(chunk_size * 3, 3000)
 
-    def ingest(self, pdf_path: str | Path) -> list[Chunk]:
+    def ingest(self, pdf_path: str | Path, policy_id:str= None) -> list[Chunk]:
         pdf_path = Path(pdf_path)
         if not pdf_path.exists():
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
         source = pdf_path.name
+        print(f"[ingestor] Policy ID: {policy_id}")
         all_chunks: list[Chunk] = []
 
         print(f"[ingestor] '{source}' — Converting to Markdown...")
@@ -292,10 +439,16 @@ class PDFIngestor:
             print(type(md_pages))
 
             DEBUG_SAVE_MARKDOWN = True
-
             if DEBUG_SAVE_MARKDOWN:
 
-                with open("debug_markdown.md", "w", encoding="utf-8") as f:
+                # Create debug/ if it doesn't already exist
+                debug_dir = Path("debug")
+                debug_dir.mkdir(exist_ok=True)
+
+                # One markdown file per PDF
+                debug_file = debug_dir / f"{pdf_path.stem}.md"
+
+                with open(debug_file, "w", encoding="utf-8") as f:
 
                     if isinstance(md_pages, str):
                         f.write(md_pages)
@@ -306,7 +459,7 @@ class PDFIngestor:
                             f.write(f"PAGE {i+1}\n")
                             f.write("=" * 80 + "\n\n")
 
-                            # dump everything in the dict
+                            # Dump everything in the page dictionary
                             for key, value in page.items():
                                 f.write(f"## {key}\n")
                                 f.write(str(value))
@@ -319,12 +472,8 @@ class PDFIngestor:
         print(f"[ingestor] '{source}' — {total} pages extracted. Chunking...")
 
         for i, page_data in enumerate(md_pages, start=1):
-            page_text = page_data.get("text", "")
+            page_text = normalize_text(page_data.get("text", ""))
 
-            # pymupdf4llm's page_chunks metadata exposes the page number under
-            # "page_number" (already 1-indexed). Older/newer versions of the
-            # library have used different key names, so we check a couple of
-            # known variants before falling back to the loop index.
             page_meta = page_data.get("metadata", {}) or {}
             page_num = (
                 page_meta.get("page_number")
@@ -337,17 +486,21 @@ class PDFIngestor:
             if not page_text.strip():
                 continue
 
-            # 1. Split by Markdown Headers (this also walks past tables fine,
-            #    since headers are "#" lines, not "|" lines)
             header_splits = self.md_splitter.split_text(page_text)
 
             for split in header_splits:
-                # Combine headers to form the structural heading/clause
-                heading_parts = [v for k, v in split.metadata.items() if k.startswith("Header")]
-                heading = " - ".join(heading_parts) if heading_parts else ""
+                # Preserve the document hierarchy
+                heading_path = [
+                    value.strip()
+                    for key, value in sorted(split.metadata.items())
+                    if key.startswith("Header") and value.strip()
+                ]
+
+                heading = heading_path[-1] if heading_path else ""
+                heading_full = " - ".join(heading_path)
 
                 # Define the parent text (useful for extended context in chain.py)
-                parent_text = split.page_content
+                parent_text = normalize_text(split.page_content)
                 if len(parent_text.split()) > 2000:
                     parent_text = " ".join(parent_text.split()[:2000]) + "..."
 
@@ -362,6 +515,7 @@ class PDFIngestor:
                         sub_texts = self.text_splitter.split_text(segment_text)
 
                     for sub_text in sub_texts:
+                        sub_text = normalize_text(sub_text)
                         word_count = len(sub_text.split())
 
                         if word_count < 10 and not segment_type.startswith("table"):
@@ -381,14 +535,21 @@ class PDFIngestor:
 
                         else:
                             embedding_text = (f"Heading: {heading}\n\n{sub_text}" if heading else sub_text)
+
+                        embedding_text = normalize_text(embedding_text)
+
+                        safe_policy_id = policy_id or Path(source).stem
                         chunk = Chunk(
                             text=sub_text,
                             metadata={
                                 "source": source,
+                                "policy_id": safe_policy_id,
                                 "page": page_num,
-                                "line": 1,  # Line numbers are less precise in MD, defaulting to 1
+                                "line": 1, 
                                 "clause": heading,
                                 "heading": heading,
+                                "heading_full": heading_full,
+                                "heading_path": " | ".join(heading_path) if heading_path else "",
                                 "type": segment_type,
                                 "tags": tags,
                                 "parent_text": parent_text,

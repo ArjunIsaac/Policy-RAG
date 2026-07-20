@@ -24,6 +24,7 @@ from constants import (
     HYBRID_FETCH_K,
     REORDER_ENABLED,
     STOPWORDS,
+    RRF_ENABLED,
 )
 
 if TYPE_CHECKING:
@@ -83,12 +84,8 @@ def transform_query(query: str) -> str:
 
 
 def extract_condition(query: str) -> str | None:
-
-
     q = query.lower()
-
     words = re.findall(r"[a-zA-Z][a-zA-Z0-9\-']+", q)
-
     stopwords = {
         "what", "is", "the", "a", "an",
         "for", "of", "on", "under",
@@ -96,7 +93,6 @@ def extract_condition(query: str) -> str | None:
         "can", "may",
         "please",
     }
-
     keywords = [w for w in words if w not in stopwords]
 
     if not keywords:
@@ -115,6 +111,7 @@ def adaptive_final_k(query : str) -> int:
         return 8
     else:
         return FINAL_K
+
 
 
 # Forced chunk injection
@@ -268,12 +265,14 @@ def retrieve_docs(
 ) -> List[Document]:
     """
     Full retrieval pipeline:
-    1. Hybrid (vector + BM25) search
+    1. Hybrid (vector + BM25) search — scoped PER POLICY when multiple
+       policies are active, so no single policy can crowd out another
+       at the fetch stage.
     2. Optional forced chunk injection for targeted medical queries
     3. Parent-text expansion + deduplication
-    4. Cross-encoder reranking
+    4. Cross-encoder reranking (single pass over the combined pool)
     5. LongContextReorder
-    6. Truncate to k
+    6. Truncate PER POLICY to guarantee representation in the final answer
     """
     ql = query.lower()
     is_targeted = any(t in ql for t in [
@@ -282,122 +281,114 @@ def retrieve_docs(
     ])
     search_type = "similarity"
 
-    # 1. Hybrid retrieval
-    hybrid = store.as_hybrid_retriever(
-        k=HYBRID_FETCH_K,
-        source_filter=source_filter,
-        search_type=search_type,
-    )
-    raw_docs: List[Document] = hybrid.invoke(query) or []
+    # ------------------------------------------------------------------
+    # 1. Hybrid retrieval — PER POLICY fetch
+    # ------------------------------------------------------------------
+    # source_filter may contain multiple policy_ids. Instead of one pooled
+    # call (which lets one policy dominate HYBRID_FETCH_K), fetch each
+    # policy's own candidates separately and merge. This guarantees every
+    # active policy reaches the reranking stage with real candidates.
+    policies = source_filter if source_filter else [None]  # None = no filter (single/all-doc mode)
+
+    raw_docs: List[Document] = []
+    for pid in policies:
+        pid_filter = [pid] if pid else None
+        hybrid = store.as_hybrid_retriever(
+            k=HYBRID_FETCH_K,
+            source_filter=pid_filter,
+            search_type=search_type,
+        )
+        policy_docs = hybrid.invoke(query) or []
+        raw_docs.extend(policy_docs)
 
     hybrid_rank = {
         id(doc): rank
         for rank, doc in enumerate(raw_docs, start=1)
     }
 
-    
     if debug:
-        print("\n=== Hybrid Retrieval ===")
-
+        print("\n=== Hybrid Retrieval (per-policy fetch) ===")
+        for pid in policies:
+            count = sum(1 for d in raw_docs if d.metadata.get("policy_id") == pid)
+            print(f"  policy_id={pid}: {count} candidates fetched")
         for i, doc in enumerate(raw_docs[:15]):
             heading = doc.metadata.get("heading", "") or doc.metadata.get("clause", "")
             print(
-                f"{i+1:2d}. "
-                f"Page {doc.metadata.get('page','?')} | "
-                f"{heading}"
+                f"{i+1:2d}. policy_id={doc.metadata.get('policy_id','?')} | "
+                f"Page {doc.metadata.get('page','?')} | {heading}"
             )
-
         print("=" * 60)
 
-    if debug:
-        print('[retrieval] ====Hybrid retrieval===')
-        for i, doc in enumerate(raw_docs[:15]):
-            print(f"  {i+1}: Page {doc.metadata.get('page','?')} | {doc.metadata.get('heading','?')}")
-
+    # ------------------------------------------------------------------
     # 2. Forced chunks for targeted queries
-    
+    # ------------------------------------------------------------------
     forced_docs: List[Document] = []
-    ENABLE_FORCED_RETRIEVAL = False # FLAG FOR BENCHMARK
+    ENABLE_FORCED_RETRIEVAL = False  # FLAG FOR BENCHMARK
     if is_targeted and ENABLE_FORCED_RETRIEVAL:
-
         print("[retrieval] Targeted query — injecting forced chunks")
         sys.stdout.flush()
         condition = extract_condition(query)
-
+        # NOTE: fetch_forced_chunks also needs per-policy scoping if
+        # source_filter has >1 policy — see note below.
         forced_docs = fetch_forced_chunks(store, source_filter, condition)
 
-    # 3. Cross-encoder rerank ALL retrieved child chunks
+    # ------------------------------------------------------------------
+    # 3. Cross-encoder rerank — single pass over the whole combined pool
+    # ------------------------------------------------------------------
     cross_enc = get_cross_encoder()
 
     if raw_docs:
-        pairs = [ (query, build_reranker_text(doc)) for doc in raw_docs ]
-
+        pairs = [(query, build_reranker_text(doc)) for doc in raw_docs]
         scores = cross_enc.predict(pairs)
-
-        scored_docs = sorted(
-            zip(raw_docs, scores),
-            key=lambda x: x[1],
-            reverse=True,
-        )
 
         ce_rank = {
             id(doc): rank
-            for rank, (doc, _) in enumerate(scored_docs, start=1)
+            for rank, (doc, _) in enumerate(sorted(
+                zip(raw_docs, scores), key=lambda x: x[1], reverse=True
+            ), start=1)
         }
+        ce_score_lookup = {id(doc): score for doc, score in zip(raw_docs, scores)}
 
-        ce_score_lookup = {
-            id(doc): score
-            for doc, score in scored_docs
-        }
+        if RRF_ENABLED:
+            RRF_K = 20
+            rrf_scores = []
+            for doc in raw_docs:
+                h = hybrid_rank.get(id(doc), len(raw_docs) + 1)
+                c = ce_rank.get(id(doc), len(raw_docs) + 1)
+                score = 1 / (RRF_K + h) + 1 / (RRF_K + c)
+                rrf_scores.append((doc, score))
 
-        RRF_K = 20
-        rrf_scores = []
-
-        for doc in raw_docs:
-            h = hybrid_rank[id(doc)]
-            c = ce_rank[id(doc)]
-
-            score = (
-                1 / (RRF_K + h)
-                + 1 / (RRF_K + c)
+            scored_docs = sorted(
+                rrf_scores,
+                key=lambda x: (x[1], ce_score_lookup[id(x[0])]),
+                reverse=True,
             )
-
-            rrf_scores.append((doc, score))
-
-        scored_docs = sorted(
-            rrf_scores,
-            key=lambda x: (
-                x[1],
-                ce_score_lookup[id(x[0])]
-            ),
-            reverse=True,
-        )
+            if debug:
+                print("\n=== RRF Fusion (Hybrid + Cross-Encoder) ===")
+        else:
+            scored_docs = sorted(zip(raw_docs, scores), key=lambda x: x[1], reverse=True)
+            if debug:
+                print("\n=== Cross-Encoder Only (No RRF) ===")
 
         if debug:
-            print("\n=== Cross Encoder Rankings ===")
-
             for i, (doc, score) in enumerate(scored_docs[:15]):
                 heading = doc.metadata.get("heading", "") or doc.metadata.get("clause", "")
                 print(
-                    f"{i+1:2d}. "
-                    f"Score={score:.4f} | "
-                    f"Page {doc.metadata.get('page','?')} | "
-                    f"{heading}"
+                    f"{i+1:2d}. Score={score:.4f} | policy_id={doc.metadata.get('policy_id','?')} | "
+                    f"Page {doc.metadata.get('page','?')} | {heading}"
                 )
-
             print("=" * 60)
-
     else:
         scored_docs = []
 
-
-
-    # 4. Deduplicate AFTER reranking
+    # ------------------------------------------------------------------
+    # 4. Deduplicate AFTER reranking (unchanged, but now works across
+    #    the multi-policy pool — parent_text dedup is content-based so
+    #    it stays policy-agnostic automatically)
+    # ------------------------------------------------------------------
     parent_map: Dict[str, Document] = {}
-
     for doc, _ in scored_docs:
         parent = doc.metadata.get("parent_text", doc.page_content)
-
         if parent not in parent_map:
             parent_map[parent] = doc
 
@@ -408,27 +399,64 @@ def retrieve_docs(
         print(f"[retrieval] Kept {len(reranked)} unique parents")
         sys.stdout.flush()
 
+    # ------------------------------------------------------------------
     # 5. Merge: forced first, then reranked (no duplicates)
+    # ------------------------------------------------------------------
     forced_keys = {(d.metadata.get("page"), d.metadata.get("heading")) for d in forced_docs}
-    final: List[Document] = list(forced_docs)
+    combined: List[Document] = list(forced_docs)
     for doc in reranked:
         key = (doc.metadata.get("page"), doc.metadata.get("heading"))
         if key not in forced_keys:
-            final.append(doc)
+            combined.append(doc)
 
-    # 6. Reorder + truncate
-    if REORDER_ENABLED and final:
-        final = LongContextReorder().transform_documents(final)
-    k = adaptive_final_k(query)
-    final = final[:k]
+    # ------------------------------------------------------------------
+    # 6. Reorder, then truncate PER POLICY (this is the actual final_k fix)
+    # ------------------------------------------------------------------
+    if REORDER_ENABLED and combined:
+        combined = LongContextReorder().transform_documents(combined)
+
+    per_policy_k = adaptive_final_k(query)
+    final = truncate_per_policy(combined, policies, per_policy_k)
 
     if debug:
-        print(f"[retrieval] Final {len(final)} docs")
+        print(f"[retrieval] Final {len(final)} docs (per_policy_k={per_policy_k})")
         for i, doc in enumerate(final):
             heading = doc.metadata.get("heading", "") or doc.metadata.get("clause", "")
-            print(f"  {i+1}: Page {doc.metadata.get('page','?')} | {heading}")
+            print(f"  {i+1}: policy_id={doc.metadata.get('policy_id','?')} | Page {doc.metadata.get('page','?')} | {heading}")
             print(f"      {doc.page_content[:200]}...")
         print("=" * 60)
         sys.stdout.flush()
+
+    return final
+
+
+def truncate_per_policy(
+    docs: List[Document],
+    policies: List[str | None],
+    per_policy_k: int,
+    max_total_chunks: int = 40,
+) -> List[Document]:
+    """
+    Given a relevance-ranked list of docs spanning multiple policies,
+    keep the top `per_policy_k` chunks FOR EACH policy, preserving their
+    relative rank order within each policy. Policy-agnostic — makes no
+    assumption about which policies are active or how many.
+
+    This is what actually prevents one policy's chunks from crowding out
+    another's in the final context sent to the LLM.
+    """
+    n_policies = max(len(policies), 1)
+    if per_policy_k * n_policies > max_total_chunks:
+        per_policy_k = max(1, max_total_chunks // n_policies)
+
+    counts: Dict[str | None, int] = {}
+    final: List[Document] = []
+
+    for doc in docs:  # docs is already ranked (reranked/RRF order preserved)
+        pid = doc.metadata.get("policy_id")
+        if counts.get(pid, 0) >= per_policy_k:
+            continue
+        counts[pid] = counts.get(pid, 0) + 1
+        final.append(doc)
 
     return final

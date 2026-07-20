@@ -11,11 +11,11 @@ src/__pycache__/
 .venv
 data/chroma_db/
 data/
+debug/
 .env
 static/
-static/raw/vllm_env.sh
+static/documents/
 *.log
 vllm_latest*.log
 .vscode/
-vllm_env.sh
 .DS_Store

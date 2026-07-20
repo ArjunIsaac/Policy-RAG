@@ -1,0 +1,376 @@
+
+
+/* ---------- Global ---------- */
+
+html, body, [class*="css"] {
+    font-family: Inter, sans-serif;
+}
+
+.stApp{
+    background:#FFFFFF;
+    color:#222222;
+}
+
+/* ---------- Sidebar ---------- */
+
+[data-testid="stSidebar"]{
+    background:#FAFAFD;
+    border-right:1px solid #ECECF3;
+}
+
+[data-testid="stSidebar"] *{
+    color:#222222;
+}
+
+/* ---------- Headings ---------- */
+
+h1,h2,h3,h4{
+    color:#222222;
+    font-weight:700;
+}
+
+.section-header{
+    color:#6C3EF4;
+    font-size:.78rem;
+    text-transform:uppercase;
+    font-weight:700;
+    letter-spacing:.08em;
+    margin:20px 0 10px;
+}
+
+/* ---------- Chat bubbles ---------- */
+
+.user-bubble{
+
+    background:#6C3EF4;
+
+    color:white;
+
+    border-radius:18px 18px 6px 18px;
+
+    padding:14px 18px;
+
+    margin:12px 0 12px 80px;
+
+    box-shadow:0 6px 18px rgba(108,62,244,.18);
+
+}
+
+.bot-bubble{
+
+    background:white;
+
+    color:#222;
+
+    border-radius:18px 18px 18px 6px;
+
+    padding:16px 20px;
+
+    margin:12px 80px 12px 0;
+
+    box-shadow:0 4px 18px rgba(0,0,0,.06);
+
+}
+
+/* ---------- Cards ---------- */
+
+.attr-card{
+
+    background:white;
+
+    border-radius:18px;
+
+    padding:18px;
+
+    margin-bottom:16px;
+
+    box-shadow:0 5px 18px rgba(0,0,0,.05);
+
+}
+
+.summary-card{
+
+    background:white;
+
+    border-radius:20px;
+
+    padding:24px;
+
+    margin-bottom:24px;
+
+    box-shadow:0 8px 24px rgba(0,0,0,.06);
+
+}
+
+.attr-label{
+
+    color:#6C3EF4;
+
+    font-weight:600;
+
+    font-size:.82rem;
+
+    margin-bottom:6px;
+
+}
+
+.attr-value{
+
+    color:#222;
+
+    font-size:1rem;
+
+    font-weight:500;
+
+}
+
+.attr-value-null{
+
+    color:#999;
+
+    font-style:italic;
+
+}
+
+/* ---------- Buttons ---------- */
+
+.stButton > button{
+
+    background:#6C3EF4;
+
+    color:white;
+
+    border:none;
+
+    border-radius:14px;
+
+    height:46px;
+
+    font-weight:600;
+
+    transition:.25s;
+
+}
+
+.stButton > button:hover{
+
+    background:#7B52FF;
+
+    color:white;
+
+}
+
+/* ---------- Inputs ---------- */
+
+.stTextInput input{
+
+    border-radius:14px;
+
+    border:1px solid #E6E6EF;
+
+}
+
+textarea{
+
+    border-radius:18px !important;
+
+}
+
+/* ---------- Metrics ---------- */
+
+[data-testid="metric-container"]{
+
+    background:white;
+
+    border-radius:16px;
+
+    padding:16px;
+
+    box-shadow:0 4px 16px rgba(0,0,0,.05);
+
+}
+
+/* ---------- Tabs ---------- */
+
+.stTabs [role="tab"]{
+
+    color:#777;
+
+    font-weight:600;
+
+}
+
+.stTabs [aria-selected="true"]{
+
+    color:#6C3EF4;
+
+}
+
+/* ---------- Citation badges ---------- */
+
+.cite-badge{
+
+    display:inline-block;
+
+    background:#F3EEFF;
+
+    color:#6C3EF4;
+
+    padding:5px 10px;
+
+    border-radius:8px;
+
+    margin:4px;
+
+    font-size:.75rem;
+
+    text-decoration:none;
+
+}
+
+.attr-page{
+
+    background:#EFE8FF;
+
+    color:#6C3EF4;
+
+    padding:4px 8px;
+
+    border-radius:6px;
+
+    text-decoration:none;
+
+}
+
+.attr-clause{
+
+    background:#F5F5F8;
+
+    color:#666;
+
+    padding:4px 8px;
+
+    border-radius:6px;
+
+}
+
+/* ---------- Expanders ---------- */
+
+.streamlit-expanderHeader{
+
+    color:#333;
+
+}
+
+/* ---------- Divider ---------- */
+
+hr{
+
+    border-color:#F0F0F5;
+
+}
+            
+/* ---------- Native Streamlit Chat ---------- */
+
+[data-testid="stChatMessage"] {
+    background: transparent;
+    padding: 0.4rem 0;
+}
+
+[data-testid="stChatMessageContent"] {
+    background: white;
+    color: #222222 !important;
+    border-radius: 18px;
+    padding: 16px 20px;
+    box-shadow: 0 4px 18px rgba(0,0,0,.06);
+}
+
+[data-testid="stMarkdownContainer"] p {
+    color: #222222;
+}
+            
+
+/* ---------- Pin chat input to bottom of screen ---------- */
+
+div[data-testid="stChatInput"] {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    z-index: 999;
+    background: #FFFFFF;
+    padding: 12px 5% 16px 5%;
+    box-shadow: 0 -4px 16px rgba(0,0,0,.05);
+}
+
+/* Adjust left offset so it doesn't sit under the sidebar */
+section[data-testid="stSidebar"][aria-expanded="true"] ~ div div[data-testid="stChatInput"] {
+    left: 21rem; /* roughly matches default sidebar width */
+}
+
+/* Stop the last part of the page content from being hidden behind the fixed bar */
+.main .block-container {
+    padding-bottom: 6rem;
+}
+
+/* ---------- Fix chat input textarea colors ---------- */
+
+div[data-testid="stChatInput"] textarea {
+    background-color: #FFFFFF !important;
+    color: #222222 !important;
+}
+
+div[data-testid="stChatInput"] textarea::placeholder {
+    color: #999999 !important;
+}
+
+/* The wrapping box around the textarea also needs a white bg */
+div[data-testid="stChatInput"] > div {
+    background-color: #FFFFFF !important;
+    border: 1px solid #E6E6EF !important;
+}         
+
+/* ---------- Force white text inside purple boxes ---------- */
+
+.stMultiSelect [data-baseweb="tag"] {
+    background-color: #6C3EF4 !important;
+}
+
+.stMultiSelect [data-baseweb="tag"] span {
+    color: #FFFFFF !important;
+}
+
+/* ---------- Fix multiselect icons (dropdown arrow, x to remove/clear) ---------- */
+
+.stMultiSelect svg {
+    fill: #FFFFFF !important;
+}
+
+/* the little x inside each selected pill */
+.stMultiSelect [data-baseweb="tag"] svg {
+    fill: #FFFFFF !important;
+}
+
+/* ---------- Top header bar: make white, keep toolbar buttons visible ---------- */
+
+header[data-testid="stHeader"] {
+    background-color: #FFFFFF !important;
+    box-shadow: 0 1px 0 #ECECF3;
+}
+
+/* Streamlit's top-left buttons (sidebar toggle, deploy, menu) — force dark icons so they show on white */
+header[data-testid="stHeader"] button svg,
+[data-testid="stToolbar"] svg,
+[data-testid="stSidebarCollapsedControl"] svg {
+    fill: #222222 !important;
+}
+
+/* Space + placement for the logo inside the header */
+.header-logo {
+    position: fixed;
+    top: 8px;
+    left: 60px; /* sits to the right of the sidebar-toggle icon */
+    height: 40px;
+    z-index: 1000;
+}
+

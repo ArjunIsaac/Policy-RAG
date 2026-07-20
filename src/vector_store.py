@@ -151,9 +151,9 @@ class PolicyVectorStore:
         where = None
         
         if source_filter and len(source_filter) == 1:
-            where = {"source": {"$eq": source_filter[0]}}
+            where = {"policy_id": {"$eq": source_filter[0]}}
         elif source_filter and len(source_filter) > 1:
-            where = {"source": {"$in": source_filter}}
+            where = {"policy_id": {"$in": source_filter}}
             
         if where:
             search_kwargs["filter"] = where
@@ -186,7 +186,7 @@ class PolicyVectorStore:
                 # 3. Combine them – favour BM25 for exact matches
                 ensemble_retriever = EnsembleRetriever(
                     retrievers=[vector_retriever, bm25_retriever], 
-                    weights=[0.3, 0.7]   # BM25 70%, vector 30%
+                    weights=[0.6, 0.4]  # Adjust weights as needed
                 )
                 return ensemble_retriever
             else:
@@ -198,12 +198,29 @@ class PolicyVectorStore:
 
     def retrieve(self, query: str, k: int = 10, source_filter: list[str] | None = None) -> list[dict[str, Any]]:
         where: dict | None = None
-        if source_filter and len(source_filter) == 1:
-            where = {"source": {"$eq": source_filter[0]}}
-        elif source_filter and len(source_filter) > 1:
-            where = {"source": {"$in": source_filter}}
+        
+        # FIX: Use "policy_id" not "source" in the filter
+        if source_filter:
+            if len(source_filter) == 1:
+                where = {"policy_id": {"$eq": source_filter[0]}}
+                print(f"[vector_store] Filtering by policy: {source_filter[0]}")
+            elif len(source_filter) > 1:
+                where = {"policy_id": {"$in": source_filter}}
+                print(f"[vector_store] Filtering by policies: {source_filter}")
 
-        results = self._vectorstore.similarity_search_with_relevance_scores(query=query, k=k, filter=where)
+        results = self._vectorstore.similarity_search_with_relevance_scores(
+            query=query, 
+            k=k, 
+            filter=where
+        )
+        
+        # Log which policies were retrieved
+        policies_seen = {}
+        for doc, score in results:
+            pid = doc.metadata.get("policy_id", "UNKNOWN")
+            policies_seen[pid] = policies_seen.get(pid, 0) + 1
+        print(f"[vector_store] Retrieved from policies: {policies_seen}")
+        
         output = []
         for doc, score in results:
             output.append({
@@ -214,6 +231,7 @@ class PolicyVectorStore:
                 "clause": doc.metadata.get("clause", ""),
                 "heading": doc.metadata.get("heading", ""),
                 "source": doc.metadata.get("source", "?"),
+                "policy_id": doc.metadata.get("policy_id", "UNKNOWN"),  # Add this
                 "score": round(score, 4),
             })
         return output
@@ -222,7 +240,7 @@ class PolicyVectorStore:
         try:
             col = self._client.get_collection(self.collection_name)
             all_meta = col.get(include=["metadatas"])["metadatas"]
-            return sorted({m.get("source", "") for m in all_meta if m})
+            return sorted({m.get("policy_id", "") for m in all_meta if m and m.get("policy_id")})
         except Exception:
             return []
 
@@ -231,3 +249,22 @@ class PolicyVectorStore:
             return self._client.get_collection(self.collection_name).count()
         except Exception:
             return 0
+        
+
+    def verify_policies(self) -> dict:
+        try:
+            col = self._client.get_collection(self.collection_name)
+            all_meta = col.get(include=["metadatas"])["metadatas"]
+            
+            policy_ids = {}
+            for meta in all_meta:
+                pid = meta.get("policy_id", "UNKNOWN")
+                if pid not in policy_ids:
+                    policy_ids[pid] = 0
+                policy_ids[pid] += 1
+            
+            print(f"[vector_store] Found policies in Chroma: {policy_ids}")
+            return policy_ids
+        except Exception as e:
+            print(f"[vector_store] Error verifying: {e}")
+            return {}

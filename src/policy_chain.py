@@ -1,5 +1,5 @@
 """
-policy_chain.py
+chain.py
 --------------
 PolicyChain — the main public interface.
 
@@ -25,16 +25,10 @@ from constants import CHAT_PROMPT, FINAL_K, MODEL_NAME
 from formatting import clean_output, extract_sources, format_docs
 from retrieval import retrieve_docs, transform_query
 from vector_store import PolicyVectorStore
+from extract_attribute import run_extraction
 
 
 class PolicyChain:
-    """
-    Main entry point for the Policy Interrogator RAG system.
-
-    Chat pipeline  : ask() / ask_stream()
-    Attribute panel: extract_attributes()
-    Debug tool     : debug_retrieval()
-    """
 
     def __init__(
         self,
@@ -50,6 +44,8 @@ class PolicyChain:
         self._source_filter = source_filter
         self._window        = memory_window
         self._history: list[HumanMessage | AIMessage] = []
+
+        print(f"[PolicyChain] Initialized with source_filter: {source_filter}")
 
 
         # Swapped ChatOllama for ChatOpenAI pointing to local vLLM server
@@ -68,6 +64,14 @@ class PolicyChain:
         self._parser = StrOutputParser()
         self._tokenizer= AutoTokenizer.from_pretrained(model,trust_remote_code=True)
 
+
+
+
+    def extract_attributes(self, source_filter=None):
+        return run_extraction(store=self._store, llm= self._llm, parser=self._parser, source_filter=source_filter or self._source_filter)
+    
+    
+    
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -86,95 +90,103 @@ class PolicyChain:
         )
 
 
-    def _build_budgeted_context(self,docs,question: str,):
-        """
-        Build the RAG context while staying inside the model's context window.
-        """
-
+    def _build_budgeted_context(self, docs, question: str):
         MAX_MODEL_CONTEXT = 4096
         MAX_OUTPUT_TOKENS = 384
         SAFETY_MARGIN = 150
 
-        # Prompt without retrieved context
         base_messages = CHAT_PROMPT.format_messages(
             context="",
             chat_history=self._trimmed_history(),
             question=question,
+            active_policy_names="",  # placeholder for token counting only
         )
-
-        base_tokens = 0
-        for m in base_messages:
-            base_tokens += len(
-                self._tokenizer.encode(
-                    m.content,
-                    add_special_tokens=False,
-                )
-            )
-
-        available = (
-            MAX_MODEL_CONTEXT
-            - MAX_OUTPUT_TOKENS
-            - SAFETY_MARGIN
-            - base_tokens
+        base_tokens = sum(
+            len(self._tokenizer.encode(m.content, add_special_tokens=False))
+            for m in base_messages
         )
+        available = MAX_MODEL_CONTEXT - MAX_OUTPUT_TOKENS - SAFETY_MARGIN - base_tokens
+
+        # Group docs by policy, preserving their relevance order within each group
+        from collections import defaultdict
+        by_policy: dict[str, list] = defaultdict(list)
+        order: list[str] = []
+        for doc in docs:
+            pid = doc.metadata.get("policy_id", "UNKNOWN")
+            if pid not in by_policy:
+                order.append(pid)
+            by_policy[pid].append(doc)
 
         context_parts = []
-        used = 0
         kept_docs = []
+        used = 0
+        pointers = {pid: 0 for pid in order}
 
-        for doc in docs:
+        # Round-robin: take one doc from each policy in turn until budget runs out
+        # or all policies are exhausted. This guarantees every policy gets a fair
+        # shot at the budget instead of the first-listed policy consuming it all.
+        progress = True
+        while progress and used < available:
+            progress = False
+            for pid in order:
+                idx = pointers[pid]
+                if idx >= len(by_policy[pid]):
+                    continue
+                doc = by_policy[pid][idx]
+                formatted = format_docs([doc])
+                n_tokens = len(self._tokenizer.encode(formatted, add_special_tokens=False))
 
-            formatted = format_docs([doc])
+                if used + n_tokens > available:
+                    pointers[pid] = len(by_policy[pid])  # stop pulling from this policy
+                    continue
 
-            n_tokens = len(
-                self._tokenizer.encode(
-                    formatted,
-                    add_special_tokens=False,
-                )
-            )
-
-            if used + n_tokens > available:
-                break
-
-            context_parts.append(formatted)
-            kept_docs.append(doc)
-            used += n_tokens
+                context_parts.append(formatted)
+                kept_docs.append(doc)
+                used += n_tokens
+                pointers[pid] = idx + 1
+                progress = True
 
         print(
-            f"[chain] Context budget: "
-            f"{used}/{available} tokens "
-            f"({len(kept_docs)}/{len(docs)} docs)"
+            f"[chain] Context budget: {used}/{available} tokens "
+            f"({len(kept_docs)}/{len(docs)} docs across {len(order)} policies)"
         )
 
         return "\n\n".join(context_parts), kept_docs
+    
+
+    def _active_policy_names(self, docs) -> str:
+        seen = []
+        for doc in docs:
+            pid = doc.metadata.get("policy_id", "UNKNOWN")
+            if pid not in seen:
+                seen.append(pid)
+        if not seen and self._source_filter:
+            seen = list(self._source_filter)
+        return ", ".join(seen) if seen else "the selected policy"
         
     # ------------------------------------------------------------------
     # Public: chat
     # ------------------------------------------------------------------
 
     def ask(self, question: str) -> dict:
-        """Synchronous ask — returns {answer, sources}."""
         t0 = time.time()
-
         expanded = transform_query(question)
         t1 = time.time(); print(f"[chain] Query transformed : {t1-t0:.2f}s"); sys.stdout.flush()
 
-        docs     = self._retrieve(expanded)
+        docs = self._retrieve(expanded)
         t2 = time.time(); print(f"[chain] Docs retrieved    : {t2-t1:.2f}s"); sys.stdout.flush()
 
-        context, docs = self._build_budgeted_context(
-        docs,
-        question,
-        )
-
-
+        context, docs = self._build_budgeted_context(docs, question)
+        active_names = self._active_policy_names(docs)          # <-- NEW
 
         messages = CHAT_PROMPT.format_messages(
             context=context,
             chat_history=self._trimmed_history(),
             question=question,
+            active_policy_names=active_names,                    # <-- NEW
         )
         t3 = time.time(); print(f"[chain] Context built     : {t3-t2:.2f}s"); sys.stdout.flush()
+        
 
         raw_answer = self._parser.invoke(self._llm.invoke(messages))
         answer     = clean_output(raw_answer)
@@ -187,18 +199,18 @@ class PolicyChain:
         return {"answer": answer, "sources": extract_sources(docs)}
 
     def ask_stream(self, question: str):
-        """Streaming ask — yields {type: 'text'|'sources', ...} dicts."""
         expanded = transform_query(question)
-        docs     = self._retrieve(expanded)
-        context, docs = self._build_budgeted_context(
-            docs,
-            question,
-        )
+        docs = self._retrieve(expanded)
+        context, docs = self._build_budgeted_context(docs, question)
+        active_names = self._active_policy_names(docs)          
+
         messages = CHAT_PROMPT.format_messages(
             context=context,
             chat_history=self._trimmed_history(),
             question=question,
+            active_policy_names=active_names,                    
         )
+        
 
         full_raw        = ""
         in_final        = False

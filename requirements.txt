@@ -22,7 +22,7 @@ sentence-transformers
 vllm==0.23.0
 
 # Streamlit
-streamlit==1.58.0
+streamlit==1.59
 
 # Data (comparison table in UI)
 pandas==3.0.2
