@@ -456,6 +456,9 @@ with st.sidebar:
     # ------------------------------------------------------------------
     st.divider()
     with st.expander("Debug Retrieval", expanded=False):
+        st.markdown(
+            '<span style="color:#888;font-size:0.85rem;">Enter a question to see what chunks are retrieved</span>',
+            unsafe_allow_html=True)
         debug_q = st.text_input("Enter a question to debug:", key="debug_question")
         if st.button("Run Debug", use_container_width=True, key="debug_run"):
             if st.session_state.chain is None:
@@ -469,7 +472,24 @@ with st.sidebar:
                     st.session_state.debug_output = debug_output
                     st.success("Debug complete. See terminal and the code block below.")
         if st.session_state.debug_output:
-            st.code(st.session_state.debug_output, language="text")
+            st.markdown(
+                """
+                <div style="
+                    background-color: #1E1E1E;
+                    border-radius: 12px;
+                    padding: 4px;
+                    margin-top: 8px;
+                    border: 1px solid #333333;
+                ">
+                """,
+                unsafe_allow_html=True
+            )
+            # Use st.code with specific language and dark theme
+            st.code(
+                st.session_state.debug_output,
+                language="text",
+                line_numbers=False)
+            st.markdown('</div>', unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
 # Main area — tabs

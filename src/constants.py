@@ -21,7 +21,7 @@ except LookupError:
 # ---------------------------------------------------------------------------
 
 MODEL_NAME = "Qwen/Qwen3-4B-AWQ"
-CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+CROSS_ENCODER_MODEL = "BAAI/bge-reranker-base"
 HYBRID_FETCH_K      = 60
 FINAL_K             = 4
 REORDER_ENABLED     = False # testing, toggle on off to see if reordering improves results

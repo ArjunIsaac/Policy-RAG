@@ -10,9 +10,12 @@ Hybrid retrieval pipeline:
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import re
 import sys
-from typing import TYPE_CHECKING, Dict, List
+from typing import TYPE_CHECKING, Dict, List, Literal, Tuple
+from collections import Counter, defaultdict
 
 from langchain_community.document_transformers import LongContextReorder
 from langchain_core.documents import Document
@@ -26,6 +29,8 @@ from constants import (
     STOPWORDS,
     RRF_ENABLED,
 )
+
+from concepts import infer_query_concepts
 
 if TYPE_CHECKING:
     from vector_store import PolicyVectorStore
@@ -44,11 +49,9 @@ def transform_query(query: str) -> str:
     ql = query.lower()
 
     synonym_map = {
-        "ped": ["pre existing disease", "pre-existing disease"],
+        "ped": ["pre existing disease", "pre-existing disease", "pre-existing illness"],
         "pre existing": ["pre-existing"],
-        "copay": ["co-payment", "co payment"],
-        "co-pay": ["co-payment"],
-        "copayment": ["co-payment"],
+        "copay": ["co-payment", "co payment","co-pay","copayment"],
         "ncb": ["no claim bonus"],
         "icu": ["intensive care unit"],
         "opd": ["outpatient", "out patient"],
@@ -59,6 +62,7 @@ def transform_query(query: str) -> str:
             "siddha",
             "homeopathy",
         ],
+        "sum insured" : ["sum assured", "coverage amount", "insured amount"],
         "maternity": ["pregnancy", "childbirth"],
         "hospitalisation": ["hospitalization"],
         "hospitalization": ["hospitalisation"],
@@ -101,16 +105,80 @@ def extract_condition(query: str) -> str | None:
     return " ".join(keywords)
 
 
-def adaptive_final_k(query : str) -> int:
-    # Determine the final number of fetched docs based on query enumeration
+@dataclass
+class RetrievalPlan:
+    intent : Literal["specific", "comparison", "enumeration","recommendation", "reasoning"]
+    per_policy_k : int
+    diversify : bool
+
+
+@dataclass
+class RetrievalRecord:
+    stage: str
+    policy_id: str
+    page: str
+    heading: str
+    score: float | None = None
+    rank: int | None = None
+
+
+@dataclass
+class RetrievalDebug:
+    query: str
+    transformed_query: str
+    intent: str
+    query_concepts: List[str]
+    vector_results: List[RetrievalRecord]
+    reranked_results: List[RetrievalRecord]
+    final_results: List[RetrievalRecord]
+    policy_stats: Dict[str, Dict[str, float]]
+    heading_stats: Dict[str, int]
+    leakage_risk: str
+
+def build_retrieval_plan( query: str, policy_count: int,) -> RetrievalPlan:
     q = query.lower()
-    enumeration_words = {'list', 'show', 'all', 'every','each','compare','different','various', 'several'}
-    q_tokens = set(q.replace("/"," ").split())
-    
-    if enumeration_words & q_tokens:
-        return 8
+
+    comparison_words = {"compare","difference","better","best","versus","vs","which"}
+
+    enumeration_words = {"list",   "all",   "every",   "each",   "show",}
+
+    reasoning_words = { "recommend", "suitable", "appropriate", "ideal", "should", "why","would", "will", "if"}
+
+    intent = "specific" # default intent
+
+    if any(w in q for w in reasoning_words):
+        intent = "reasoning"
+
+    elif any(w in q for w in comparison_words):
+        intent = "comparison"
+
+    elif any(w in q for w in enumeration_words):
+        intent = "enumeration"
+
+    if intent == "specific":
+        k = 4
+        diversify = False
+
+    elif intent == "comparison":
+        k = 5
+        diversify = True
+
+    elif intent == "enumeration":
+        k = 6
+        diversify = True
+
     else:
-        return FINAL_K
+        k = 6
+        diversify = True
+
+    return RetrievalPlan(
+
+        intent=intent,
+
+        per_policy_k=k,
+
+        diversify=diversify,
+    )
 
 
 
@@ -209,24 +277,40 @@ def get_cross_encoder() -> CrossEncoder:
 
 
 def build_reranker_text(doc: Document) -> str:
-    """
-    Build a semantically rich passage for the cross-encoder.
-    This text is ONLY used for reranking.
-    It is never shown to the LLM.
-    """
+    # Build a text representation of the document for cross-encoder reranking.
 
     md = doc.metadata
 
     parts = []
 
+    # policy
+    policy = md.get("policy_id")
+    if policy:
+        parts.append(f"Policy: {policy}")
+
+
+    # heirarchy
     heading = md.get("heading")
     if heading:
         parts.append(f"Section: {heading}")
+
+    heading_path = md.get("heading_path")
+    if heading_path:
+        parts.append(f"Section Path: {heading_path}")
 
     clause = md.get("clause")
     if clause and clause != heading:
         parts.append(f"Clause: {clause}")
 
+
+    # position
+
+    idx = md.get("chunk_index")
+    total = md.get("section_chunk_count")
+    if idx and total:
+        parts.append(f"Chunk: {idx}/{total}")
+
+    # metadata
     chunk_type = md.get("type")
     if chunk_type:
         parts.append(f"Content Type: {chunk_type}")
@@ -235,15 +319,20 @@ def build_reranker_text(doc: Document) -> str:
     if tags:
         parts.append(f"Tags: {', '.join(tags)}")
 
+
+    concepts =  md.get("concepts")
+    if concepts:
+        parts.append(f"Concepts: {', '.join(concepts)}")
+
     if md.get("is_definition"):
         parts.append("Contains: Definition")
 
-    metadata = doc.metadata
+    
 
-    chunk_type = metadata.get("type", "")
+    # passage   
 
     if chunk_type.startswith("table"):
-        passage = metadata.get("embedding_text", doc.page_content)
+        passage = md.get("embedding_text", doc.page_content)
     else:
         passage = doc.page_content
 
@@ -251,6 +340,47 @@ def build_reranker_text(doc: Document) -> str:
     parts.append(passage)
 
     return "\n\n".join(parts)
+
+
+def _estimate_tokens(text: str) -> int:
+    # Lightweight estimate (~4 chars/token)
+    return max(1, len(text) // 4)
+
+
+def _build_policy_stats(docs: List[Document], score_lookup: Dict[int, float]) -> Dict[str, Dict[str, float]]:
+    stats: Dict[str, Dict[str, float]] = defaultdict(
+        lambda: {"chunks": 0, "tokens": 0, "avg_score": 0.0}
+    )
+    score_sums: Dict[str, float] = defaultdict(float)
+
+    for doc in docs:
+        pid = doc.metadata.get("policy_id", "UNKNOWN")
+        stats[pid]["chunks"] += 1
+        stats[pid]["tokens"] += _estimate_tokens(doc.page_content)
+        score = score_lookup.get(id(doc))
+        if score is not None:
+            score_sums[pid] += score
+
+    for pid, s in stats.items():
+        if s["chunks"]:
+            s["avg_score"] = round(score_sums[pid] / s["chunks"], 4)
+
+    return dict(stats)
+
+
+def _compute_leakage_risk(policy_stats: Dict[str, Dict[str, float]]) -> str:
+    if len(policy_stats) <= 1:
+        return "LOW"
+
+    token_counts = [v["tokens"] for v in policy_stats.values()]
+    min_tokens = min(token_counts)
+    max_tokens = max(token_counts)
+
+    if max_tokens >= 3 * max(min_tokens, 1):
+        return "HIGH"
+    if max_tokens >= 1.5 * max(min_tokens, 1):
+        return "MEDIUM"
+    return "LOW"
 
 # ---------------------------------------------------------------------------
 # Main retrieval pipeline
@@ -262,7 +392,8 @@ def retrieve_docs(
     source_filter: list[str] | None,
     k: int = FINAL_K,
     debug: bool = False,
-) -> List[Document]:
+    transformed_query: str | None = None,
+) -> Tuple[List[Document], RetrievalDebug | None]:
     """
     Full retrieval pipeline:
     1. Hybrid (vector + BM25) search — scoped PER POLICY when multiple
@@ -275,11 +406,14 @@ def retrieve_docs(
     6. Truncate PER POLICY to guarantee representation in the final answer
     """
     ql = query.lower()
+    query_concepts = infer_query_concepts(query)
     is_targeted = any(t in ql for t in [
         "cancer", "carcinoma", "melanoma", "tumor",
         "eye", "surgery", "cataract", "lasik", "refractive",
     ])
     search_type = "similarity"
+
+    
 
     # ------------------------------------------------------------------
     # 1. Hybrid retrieval — PER POLICY fetch
@@ -288,7 +422,38 @@ def retrieve_docs(
     # call (which lets one policy dominate HYBRID_FETCH_K), fetch each
     # policy's own candidates separately and merge. This guarantees every
     # active policy reaches the reranking stage with real candidates.
-    policies = source_filter if source_filter else [None]  # None = no filter (single/all-doc mode)
+
+
+    # ------------------------------------------------------------------
+    # Determine active policies
+    # ------------------------------------------------------------------
+    policies = source_filter if source_filter else [None]
+
+    # Build retrieval plan early (needed for debugging)
+    plan = build_retrieval_plan(
+        query=query,
+        policy_count=len(policies),
+    )
+
+    # Initialize debug object
+    debug_obj: RetrievalDebug | None = None
+    if debug:
+        debug_obj = RetrievalDebug(
+            query=query,
+            transformed_query=transformed_query or query,
+            intent=plan.intent,
+            query_concepts=query_concepts,
+            vector_results=[],
+            reranked_results=[],
+            final_results=[],
+            policy_stats={},
+            heading_stats={},
+            leakage_risk="LOW",
+        )
+
+    # ------------------------------------------------------------------
+    # 1. Hybrid retrieval — PER POLICY fetch
+    # ------------------------------------------------------------------
 
     raw_docs: List[Document] = []
     for pid in policies:
@@ -300,6 +465,20 @@ def retrieve_docs(
         )
         policy_docs = hybrid.invoke(query) or []
         raw_docs.extend(policy_docs)
+
+        if debug_obj:
+            for rank, doc in enumerate(policy_docs, start=1):
+                debug_obj.vector_results.append(
+                    RetrievalRecord(
+                        stage="vector",
+                        policy_id=doc.metadata.get("policy_id", "UNKNOWN"),
+                        page=str(doc.metadata.get("page", "?")),
+                        heading=doc.metadata.get("heading", "") or doc.metadata.get("clause", ""),
+                        rank=rank,
+                    )
+                )
+
+
 
     hybrid_rank = {
         id(doc): rank
@@ -340,7 +519,10 @@ def retrieve_docs(
     if raw_docs:
         pairs = [(query, build_reranker_text(doc)) for doc in raw_docs]
         scores = cross_enc.predict(pairs)
-
+        scores = [s + concept_alignment_bonus(doc.metadata.get("concepts", []), query_concepts)
+                for s, doc in zip(scores, raw_docs)
+                    ]
+        
         ce_rank = {
             id(doc): rank
             for rank, (doc, _) in enumerate(sorted(
@@ -415,11 +597,11 @@ def retrieve_docs(
     if REORDER_ENABLED and combined:
         combined = LongContextReorder().transform_documents(combined)
 
-    per_policy_k = adaptive_final_k(query)
-    final = truncate_per_policy(combined, policies, per_policy_k)
+
+    final = truncate_per_policy(combined, policies, per_policy_k=plan.per_policy_k)
 
     if debug:
-        print(f"[retrieval] Final {len(final)} docs (per_policy_k={per_policy_k})")
+        print(f"[retrieval] Final {len(final)} docs (intent={plan.intent}) (per_policy_k={plan.per_policy_k})")
         for i, doc in enumerate(final):
             heading = doc.metadata.get("heading", "") or doc.metadata.get("clause", "")
             print(f"  {i+1}: policy_id={doc.metadata.get('policy_id','?')} | Page {doc.metadata.get('page','?')} | {heading}")
@@ -427,7 +609,29 @@ def retrieve_docs(
         print("=" * 60)
         sys.stdout.flush()
 
-    return final
+
+    if debug_obj:
+        for rank, doc in enumerate(final, start=1):
+            debug_obj.final_results.append(
+                RetrievalRecord(
+                    stage="final",
+                    policy_id=doc.metadata.get("policy_id", "UNKNOWN"),
+                    page=str(doc.metadata.get("page", "?")),
+                    heading=doc.metadata.get("heading", "") or doc.metadata.get("clause", ""),
+                    rank=rank,
+                )
+            )
+
+        debug_obj.policy_stats = _build_policy_stats(final, ce_score_lookup if raw_docs else {})
+        debug_obj.heading_stats = dict(
+            Counter(
+                doc.metadata.get("heading", "") or doc.metadata.get("clause", "")
+                for doc in final
+            )
+        )
+        debug_obj.leakage_risk = _compute_leakage_risk(debug_obj.policy_stats)
+
+    return final, debug_obj
 
 
 def truncate_per_policy(
@@ -460,3 +664,14 @@ def truncate_per_policy(
         final.append(doc)
 
     return final
+
+def concept_alignment_bonus(doc_concepts: list[str], query_concepts: list[str]) -> float:
+    if not query_concepts:
+        return 0.0
+    doc_set = set(doc_concepts or [])
+    query_set = set(query_concepts)
+    if doc_set & query_set:
+        return 0.15          # boost: doc matches a concept the query asked about
+    if doc_set and query_set and not (doc_set & query_set):
+        return -0.15         # penalty: doc belongs to a *different* concept than what was asked
+    return 0.0

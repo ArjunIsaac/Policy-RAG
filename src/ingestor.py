@@ -12,9 +12,12 @@ import unicodedata
 from pathlib import Path
 
 import pymupdf4llm
+import fitz
+from datetime import datetime, timezone
 from langchain_text_splitters import MarkdownHeaderTextSplitter, RecursiveCharacterTextSplitter
 
 from datatypes import Chunk
+from concepts import infer_concepts
 
 # ---------------------------------------------------------------------------
 # Regex patterns for semantic tagging
@@ -428,6 +431,22 @@ class PDFIngestor:
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
         source = pdf_path.name
+        doc = fitz.open(str(pdf_path))
+        doc_meta = doc.metadata or {}
+        doc.close()
+
+        creation_date = doc_meta.get("creationDate") or doc_meta.get("modDate")
+        creation_date_is_fallback = False
+        if not creation_date:
+            # No embedded date at all (seen with Aditya Birla) — fall back to
+            # file mtime so versioning/staleness checks never silently break,
+            # but flag it so it's not mistaken for an insurer-issued date.
+            creation_date = datetime.fromtimestamp(
+                pdf_path.stat().st_mtime, tz=timezone.utc
+            ).isoformat()
+            creation_date_is_fallback = True
+
+        extraction_tool = doc_meta.get("producer") or doc_meta.get("creator") or "unknown"
         print(f"[ingestor] Policy ID: {policy_id}")
         all_chunks: list[Chunk] = []
 
@@ -475,13 +494,13 @@ class PDFIngestor:
             page_text = normalize_text(page_data.get("text", ""))
 
             page_meta = page_data.get("metadata", {}) or {}
-            page_num = (
-                page_meta.get("page_number")
-                if page_meta.get("page_number") is not None
-                else page_meta.get("page")
-            )
-            if page_num is None:
-                page_num = i  # loop index is already 1-indexed via start=1
+
+            # `i` is the physical position of this page as extracted, and is the
+            # ONLY number guaranteed to match the PDF a human opens and counts.
+            # PDFs (e.g. ICICI) may declare an internal /PageLabel or restart
+            # numbering per section — never let that override citations.
+            page_num = i
+            pdf_declared_label = page_meta.get("page_number", page_meta.get("page"))
 
             if not page_text.strip():
                 continue
@@ -499,6 +518,19 @@ class PDFIngestor:
                 heading = heading_path[-1] if heading_path else ""
                 heading_full = " - ".join(heading_path)
 
+                safe_policy_id = policy_id or Path(source).stem
+
+                section_id = (
+                    heading_full.lower()
+                    .strip()
+                    .replace(" ", "_")
+                    .replace("/", "_")
+                    .replace("\\", "_")
+                )
+
+                section_level = len(heading_path)
+
+
                 # Define the parent text (useful for extended context in chain.py)
                 parent_text = normalize_text(split.page_content)
                 if len(parent_text.split()) > 2000:
@@ -514,7 +546,12 @@ class PDFIngestor:
                     else:
                         sub_texts = self.text_splitter.split_text(segment_text)
 
-                    for sub_text in sub_texts:
+
+                    total_chunks = len(sub_texts)
+
+
+
+                    for chunk_index, sub_text in enumerate(sub_texts, start=1):
                         sub_text = normalize_text(sub_text)
                         word_count = len(sub_text.split())
 
@@ -522,6 +559,22 @@ class PDFIngestor:
                             continue
 
                         tags = _tags(sub_text)
+                        concepts = infer_concepts(
+                                        heading=heading,
+                                        heading_full=heading_full,
+                                        heading_path=heading_path,
+                                        tags=tags,
+                                        text=sub_text,
+                                    )
+                        
+                        if concepts:
+                            print(
+                                f"[Concepts] "
+                                f"{heading} -> {concepts}"
+    )
+                        
+                        
+
                         is_definition = "definition" in heading.lower() or "Def." in sub_text
                         if is_definition and "definition" not in tags:
                             tags.append("definition")
@@ -529,29 +582,81 @@ class PDFIngestor:
                             tags.append("critical_illness")
                         if segment_type == "table" and "table" not in tags:
                             tags.append("table")
+                            
+                        # Rich semantic embedding representation
+
+                        embedding_prefix = f"""
+                        Policy:
+                        {safe_policy_id}
+
+                        Hierarchy:
+                        {heading_full if heading_full else "Root"}
+
+                        Current Section:
+                        {heading if heading else "Document"}
+
+                        Section Level:
+                        {section_level}
+
+                        Chunk:
+                        {chunk_index} of {total_chunks}
+
+                        Content Type:
+                        {segment_type}
+                        """.strip()
+
 
                         if segment_type.startswith("table"):
-                            embedding_text = build_table_embedding_text(heading=heading, table_text=sub_text,segment_type=segment_type)
+
+                            table_repr = build_table_embedding_text(
+                                heading=heading,
+                                table_text=sub_text,
+                                segment_type=segment_type,
+                            )
+
+                            embedding_text = (
+                                embedding_prefix
+                                + "\n\n"
+                                + table_repr
+                            )
 
                         else:
-                            embedding_text = (f"Heading: {heading}\n\n{sub_text}" if heading else sub_text)
+
+                            embedding_text = (
+                                embedding_prefix
+                                + "\n\nContent:\n\n"
+                                + sub_text
+                            )
 
                         embedding_text = normalize_text(embedding_text)
 
-                        safe_policy_id = policy_id or Path(source).stem
+                        
                         chunk = Chunk(
                             text=sub_text,
                             metadata={
                                 "source": source,
+                                "creation_date": creation_date,
+                                "creation_date_is_fallback": creation_date_is_fallback,
+                                "source_producer": extraction_tool,
+                                
                                 "policy_id": safe_policy_id,
                                 "page": page_num,
+                                "pdf_declared_label": pdf_declared_label,
                                 "line": 1, 
                                 "clause": heading,
                                 "heading": heading,
                                 "heading_full": heading_full,
                                 "heading_path": " | ".join(heading_path) if heading_path else "",
+                                "section_id": section_id,
+                                "section_level": section_level,
+
+                                # Position within this section
+                                "chunk_index": chunk_index,
+                                "section_chunk_count": total_chunks,
                                 "type": segment_type,
                                 "tags": tags,
+                                "concepts": "|".join(concepts),
+                                "primary_concept": concepts[0] if concepts else None,
                                 "parent_text": parent_text,
                                 "is_definition": is_definition,
                                 "embedding_text": embedding_text,

@@ -328,7 +328,7 @@ div[data-testid="stChatInput"] textarea::placeholder {
 div[data-testid="stChatInput"] > div {
     background-color: #FFFFFF !important;
     border: 1px solid #E6E6EF !important;
-}         
+}      
 
 /* ---------- Force white text inside purple boxes ---------- */
 
@@ -363,6 +363,65 @@ header[data-testid="stHeader"] button svg,
 [data-testid="stToolbar"] svg,
 [data-testid="stSidebarCollapsedControl"] svg {
     fill: #222222 !important;
+}
+
+
+/* ---------- Debug Output Fix ---------- */
+
+/* Fix code block in debug section */
+[data-testid="stCodeBlock"] {
+    background-color: #1E1E1E !important;
+    border-radius: 12px;
+    padding: 4px;
+}
+
+[data-testid="stCodeBlock"] pre {
+    background-color: #1E1E1E !important;
+    color: #E6E6E6 !important;
+}
+
+[data-testid="stCodeBlock"] code {
+    color: #E6E6E6 !important;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 0.85rem;
+    line-height: 1.6;
+}
+
+/* Fix for the debug textarea/input */
+div[data-testid="stTextInput"] input {
+    background-color: #FFFFFF !important;
+    color: #222222 !important;
+    border: 1px solid #E6E6EF !important;
+    border-radius: 12px;
+}
+
+div[data-testid="stTextInput"] input::placeholder {
+    color: #999999 !important;
+}
+
+/* Fix for debug expander */
+.streamlit-expanderContent {
+    background-color: #1E1E1E !important;
+    border-radius: 0 0 12px 12px;
+    padding: 8px;
+}
+
+/* Fix for success message in debug */
+[data-testid="stAlert"] {
+    border-radius: 12px;
+}
+
+/* Override any dark theme bleeding into debug */
+div[data-testid="stExpander"] .stCodeBlock {
+    background-color: #1E1E1E !important;
+}
+
+div[data-testid="stExpander"] .stCodeBlock pre {
+    background-color: #1E1E1E !important;
+}
+
+div[data-testid="stExpander"] .stCodeBlock code {
+    color: #E6E6E6 !important;
 }
 
 /* Space + placement for the logo inside the header */

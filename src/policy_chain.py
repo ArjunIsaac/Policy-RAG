@@ -80,13 +80,14 @@ class PolicyChain:
         keep = self._window * 2
         return self._history[-keep:] if len(self._history) > keep else self._history[:]
 
-    def _retrieve(self, query: str, debug: bool = False):
+    def _retrieve(self, query: str, debug: bool = False, transformed_query: str | None = None):
         return retrieve_docs(
             store=self._store,
             query=query,
             source_filter=self._source_filter,
             k=self._k,
-            debug=debug,
+            debug=True, # for benchmark tests
+            transformed_query=transformed_query,
         )
 
 
@@ -173,7 +174,8 @@ class PolicyChain:
         expanded = transform_query(question)
         t1 = time.time(); print(f"[chain] Query transformed : {t1-t0:.2f}s"); sys.stdout.flush()
 
-        docs = self._retrieve(expanded)
+        docs, _ = self._retrieve(expanded, transformed_query=expanded)
+
         t2 = time.time(); print(f"[chain] Docs retrieved    : {t2-t1:.2f}s"); sys.stdout.flush()
 
         context, docs = self._build_budgeted_context(docs, question)
@@ -200,7 +202,7 @@ class PolicyChain:
 
     def ask_stream(self, question: str):
         expanded = transform_query(question)
-        docs = self._retrieve(expanded)
+        docs, _ = self._retrieve(expanded, transformed_query=expanded)
         context, docs = self._build_budgeted_context(docs, question)
         active_names = self._active_policy_names(docs)          
 
@@ -255,18 +257,68 @@ class PolicyChain:
         expanded = transform_query(question)
         print(f"\n[DEBUG] Transformed query: {expanded}")
         sys.stdout.flush()
-        docs = self._retrieve(expanded, debug=True)
+
+        docs, dbg = self._retrieve(expanded, debug=True, transformed_query=expanded)
+
+        if dbg is None:
+            return "No debug information available."
 
         lines = [
-            f"Transformed query: {expanded}",
-            "=" * 60,
-            f"Final {len(docs)} documents retrieved.",
+            "=" * 70,
+            "QUERY",
+            "=" * 70,
+            f"Original:    {dbg.query}",
+            f"Transformed: {dbg.transformed_query}",
+            f"Intent:      {dbg.intent}",
+            "",
+            "=" * 70,
+            "FINAL POLICY BALANCE",
+            "=" * 70,
         ]
-        for i, doc in enumerate(docs):
-            heading = doc.metadata.get("heading", "") or doc.metadata.get("clause", "")
-            lines.append(f"[{i+1}] Page: {doc.metadata.get('page','?')} | Heading: {heading}")
-            lines.append(f"    Content preview: {doc.page_content[:200]}...")
-        lines.append("=" * 60)
+
+        for pid, stats in dbg.policy_stats.items():
+            lines.append(
+                f"{pid}: chunks={int(stats['chunks'])}, "
+                f"tokens≈{int(stats['tokens'])}, avg_score={stats['avg_score']:.4f}"
+            )
+
+        lines.extend([
+            f"Leakage Risk: {dbg.leakage_risk}",
+            "",
+            "=" * 70,
+            "HEADING DISTRIBUTION",
+            "=" * 70,
+        ])
+
+        for heading, count in sorted(dbg.heading_stats.items(), key=lambda x: x[1], reverse=True):
+            lines.append(f"{count:2d} × {heading}")
+
+        lines.extend([
+            "",
+            "=" * 70,
+            "TOP RERANKED RESULTS",
+            "=" * 70,
+        ])
+
+        for rec in dbg.reranked_results[:10]:
+            lines.append(
+                f"#{rec.rank:2d} | {rec.policy_id} | p.{rec.page} | "
+                f"score={rec.score:.4f} | {rec.heading}"
+            )
+
+        lines.extend([
+            "",
+            "=" * 70,
+            "FINAL CONTEXT",
+            "=" * 70,
+        ])
+
+        for rec in dbg.final_results:
+            lines.append(
+                f"#{rec.rank:2d} | {rec.policy_id} | p.{rec.page} | {rec.heading}"
+            )
+
+        lines.append("=" * 70)
         return "\n".join(lines)
 
    

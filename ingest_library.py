@@ -19,7 +19,8 @@ DOCUMENT_DIR = Path("static/documents")
 POLICIES = {
     "hdfc health plan.pdf": "hdfc_health",
     "icici lombard plan.pdf": "icici_health",
-    "LIC insurance.pdf": "lic_health",
+    "aditya birla health plan.pdf": "aditya_birla_health",
+    "bajaj health plan.pdf": "bajaj_health",
 }
 
 
